@@ -77,6 +77,8 @@ data class AgentSettings(
     val liveEnabled: Boolean = false,
     /** Play voice notes (and read replies) automatically while earphones are in. */
     val autoPlayEarphones: Boolean = true,
+    /** The chat thread on screen (multi-chat). "main" is the original chat. */
+    val activeChat: String = "main",
 ) {
     val ready: Boolean get() = when (mode) {
         PowerMode.API_KEY -> hasKey
@@ -133,6 +135,7 @@ class SettingsStore(context: Context) {
             browserProfiles = (prefs.getString("browserProfiles", null) ?: "Personal").split("\n").filter { it.isNotBlank() }.ifEmpty { listOf("Personal") },
             subKind = runCatching { SubKind.valueOf(prefs.getString("subKind", "CLAUDE")!!) }.getOrDefault(SubKind.CLAUDE),
             helperRoster = HelperModel.listFrom(prefs.getString(rosterKey(), null)),
+            activeChat = prefs.getString("active_chat", null)?.takeIf { it.isNotBlank() } ?: "main",
         )
     }
 
@@ -200,8 +203,18 @@ class SettingsStore(context: Context) {
     fun secret(key: String): String? = secrets.getString("s_$key", null)
     fun setSecret(key: String, value: String?) { secrets.edit().apply { if (value.isNullOrEmpty()) remove("s_$key") else putString("s_$key", value) }.apply() }
 
+    /** The chat thread the user is looking at ("main" for the original chat). */
+    fun activeChat(): String = prefs.getString("active_chat", null)?.takeIf { it.isNotBlank() } ?: "main"
+    fun setActiveChat(id: String) = edit { putString("active_chat", id.ifBlank { "main" }) }
+    /** Per-chat read mark (highest seen chat_items id), for unread badges. */
+    fun chatRead(chat: String): Long = prefs.getString("x_read_$chat", null)?.toLongOrNull() ?: 0L
+    fun setChatRead(chat: String, id: Long) { prefs.edit().putString("x_read_$chat", id.toString()).apply() }
+
     fun extra(key: String): String? = prefs.getString("x_$key", null)
     fun setExtra(key: String, value: String?) { prefs.edit().apply { if (value == null) remove("x_$key") else putString("x_$key", value) }.apply() }
+    /** Per-chat subscription-engine session (mirrors Muse's per-session server threads). */
+    fun chatSession(chat: String): String? = extra("session_$chat")
+    fun setChatSession(chat: String, session: String?) = setExtra("session_$chat", session)
 
     fun resetAll() { prefs.edit().clear().apply(); secrets.edit().clear().apply(); _state.value = read() }
 }

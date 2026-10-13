@@ -274,7 +274,8 @@ class MainActivity : ComponentActivity() {
         val cards by g.cards.cards.collectAsStateWithLifecycle()
         var openCard by remember { mutableStateOf<String?>(null) }
         var refreshingCard by remember { mutableStateOf<String?>(null) }
-        val home = HomeState(settings.agentName, settings.userName, status, items, goals, tasks, routines,
+        val homeItems = remember(items, settings.activeChat) { items.filter { it.chatId == settings.activeChat } }
+        val home = HomeState(settings.agentName, settings.userName, status, homeItems, goals, tasks, routines,
             notifRows.count { it.postedAt > System.currentTimeMillis() - 86_400_000L }, settings.notifApps.size, browserLive, cards = cards.filter { it.pinned })
         val barRoutes = setOf("home", "tasks", "memory", "routines", "connections")
         val barPad = 112.dp
@@ -318,11 +319,26 @@ class MainActivity : ComponentActivity() {
                     ))
                 }
                 composable("chat") {
-                    ChatScreen(items, status, settings.agentName, settings.userName, browserLive, draft, { draft = it },
+                    val activeChat = settings.activeChat
+                    val chatItems = remember(items, activeChat) { items.filter { it.chatId == activeChat } }
+                    val threads by g.db.chats().all().collectAsStateWithLifecycle(emptyList())
+                    val activeThread = remember(threads, activeChat) { threads.firstOrNull { it.id == activeChat } }
+                    // Unread = agent/report rows above the per-chat mark.
+                    val unreadByChat = remember(items, threads) {
+                        threads.associate { t ->
+                            val mark = g.settings.chatRead(t.id)
+                            t.id to items.count { it.chatId == t.id && it.id > mark && (it.kind == "agent" || it.kind == "report") }
+                        }
+                    }
+                    var threadsOpen by remember { mutableStateOf(false) }
+                    ChatScreen(chatItems, status, settings.agentName, settings.userName, browserLive, draft, { draft = it },
                         listening = dictating,
-                        readMark = { g.settings.extra("chatRead")?.toLongOrNull() ?: Long.MAX_VALUE },
-                        onRead = { id -> if (id > (g.settings.extra("chatRead")?.toLongOrNull() ?: 0L)) g.settings.setExtra("chatRead", id.toString()) },
+                        chatTitle = activeThread?.title.orEmpty(),
+                        readMark = { g.settings.chatRead(activeChat).takeIf { it > 0 } ?: Long.MAX_VALUE },
+                        onRead = { id -> if (id > g.settings.chatRead(activeChat)) g.settings.setChatRead(activeChat, id) },
                         actions = ChatActions(
+                            onThreads = { threadsOpen = true },
+                            threadBadges = unreadByChat.filterKeys { it != activeChat }.values.sum(),
                             onCard = { openCard = it },
                             onSend = { g.stopSpeaking(); com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity)
                                 val docText = docs.entries.joinToString("") { (n, d) -> "\n\n[Attached document: $n${docPaths[n]?.let { p -> ", file saved at $p (you can upload it with browser_upload)" }.orEmpty()}]\n${d.first.take(30_000)}" }
@@ -343,6 +359,19 @@ class MainActivity : ComponentActivity() {
                         morning = if (!morningNow) null else (brief?.takeIf { it.ideas.isNotEmpty() }?.let { b ->
                             com.past9.phoneaos.ui.screens.MorningUi(b.greeting, b.line, b.body, b.ideas.map { it.icon to it.text }, preparingBrief, { com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity) })
                         } ?: com.past9.phoneaos.ui.screens.MorningUi(preparing = preparingBrief, onBackToChat = { com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity) })))
+                    if (threadsOpen) com.past9.phoneaos.ui.screens.ThreadsSheet(
+                        rows = threads.map { t ->
+                            val last = items.lastOrNull { it.chatId == t.id && (it.kind == "user" || it.kind == "agent") }
+                            com.past9.phoneaos.ui.screens.ThreadRow(t, last?.text.orEmpty(), unreadByChat[t.id] ?: 0, t.id == activeChat)
+                        },
+                        onPick = { id -> scope.launch { g.runtime.switchChat(id); threadsOpen = false } },
+                        onNew = { scope.launch { g.runtime.newChat(); threadsOpen = false } },
+                        onRename = { id, title -> scope.launch { g.runtime.renameChat(id, title) } },
+                        onPin = { id, pinned -> scope.launch { g.runtime.pinChat(id, pinned) } },
+                        onArchive = { id, archived -> scope.launch { g.runtime.archiveChat(id, archived) } },
+                        onDelete = { id -> scope.launch { g.runtime.deleteChat(id) } },
+                        onDismiss = { threadsOpen = false },
+                    )
                 }
                 composable("report?path={path}") { e ->
                     ReportScreen(e.arguments?.getString("path").orEmpty(), onBack = { nav.popBackStack() })
@@ -490,8 +519,8 @@ class MainActivity : ComponentActivity() {
                 composable("call") {
                     val cst by g.call.state.collectAsStateWithLifecycle()
                     CallScreen(settings.agentName, cst, onMute = { g.call.toggleMute() }, onEnd = { g.call.end(); nav.popBackStack() }, onStart = { g.call.start() },
-                        actions = items.filter { it.kind == "activity" && it.createdAt >= g.call.callStart && g.call.callStart > 0 }.map { it.text },
-                        question = items.lastOrNull { it.kind == "question" && !org.json.JSONObject(it.meta).has("answer") },
+                        actions = items.filter { it.chatId == settings.activeChat && it.kind == "activity" && it.createdAt >= g.call.callStart && g.call.callStart > 0 }.map { it.text },
+                        question = items.lastOrNull { it.chatId == settings.activeChat && it.kind == "question" && !org.json.JSONObject(it.meta).has("answer") },
                         onAnswer = { id, o -> g.runtime.answer(id, o) }, onBrowser = { nav.navigate("browser") { launchSingleTop = true } })
                 }
                 composable("style") {

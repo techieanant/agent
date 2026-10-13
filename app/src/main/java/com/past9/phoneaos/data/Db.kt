@@ -13,6 +13,16 @@ import androidx.room.RoomDatabase
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
+/** One chat thread in the multi-chat list. "main" is the original chat: never deletable, owns routine output. */
+@Entity(tableName = "chats")
+data class ChatThread(
+    @PrimaryKey val id: String = "main",
+    val title: String = "Main chat",
+    val pinned: Boolean = false,
+    val archived: Boolean = false,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis(),
+)
 /** One row in the chat the user sees. `kind` decides how it renders. */
 @Entity(tableName = "chat_items")
 data class ChatItem(
@@ -23,6 +33,8 @@ data class ChatItem(
     /** Free JSON: tool name, status, options, chosen answer... */
     val meta: String = "{}",
     val createdAt: Long = System.currentTimeMillis(),
+    /** Which chat thread this row belongs to ("main" for the original chat). */
+    val chatId: String = "main",
 )
 
 /** One provider-neutral message of the model's own transcript (JSON of agent.Msg). */
@@ -116,17 +128,31 @@ interface NotificationDao {
 }
 
 @Dao
+interface ChatsDao {
+    @Query("SELECT * FROM chats ORDER BY pinned DESC, updatedAt DESC") fun all(): Flow<List<ChatThread>>
+    @Query("SELECT * FROM chats ORDER BY pinned DESC, updatedAt DESC") suspend fun list(): List<ChatThread>
+    @Query("SELECT * FROM chats WHERE id = :id") suspend fun get(id: String): ChatThread?
+    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insert(t: ChatThread)
+    @Update suspend fun update(t: ChatThread)
+    @Query("DELETE FROM chats WHERE id = :id") suspend fun delete(id: String)
+}
+
+@Dao
 interface ChatDao {
     @Query("SELECT * FROM chat_items ORDER BY id") fun all(): Flow<List<ChatItem>>
+    @Query("SELECT * FROM chat_items WHERE chatId = :chat ORDER BY id") fun inChat(chat: String): Flow<List<ChatItem>>
+    @Query("SELECT * FROM chat_items WHERE chatId = :chat ORDER BY id DESC LIMIT 1") suspend fun lastIn(chat: String): ChatItem?
     @Insert suspend fun insert(item: ChatItem): Long
     @Update suspend fun update(item: ChatItem)
     @Query("SELECT * FROM chat_items WHERE id = :id") suspend fun get(id: Long): ChatItem?
     @Query("DELETE FROM chat_items") suspend fun clear()
+    @Query("DELETE FROM chat_items WHERE chatId = :chat") suspend fun clearChat(chat: String)
 
     @Query("SELECT * FROM turns WHERE thread = :thread ORDER BY id DESC LIMIT :limit") suspend fun recentTurns(thread: String, limit: Int): List<TurnRow>
     @Insert suspend fun insertTurn(t: TurnRow): Long
     @Query("DELETE FROM turns WHERE thread = :thread") suspend fun clearTurns(thread: String)
     @Query("DELETE FROM turns WHERE thread LIKE 'branch-%'") suspend fun clearBranchTurns()
+    @Query("DELETE FROM turns WHERE thread = :chat OR thread LIKE :chat || '/%'") suspend fun clearChatTurns(chat: String)
 }
 
 @Dao
@@ -169,12 +195,13 @@ interface TriggerDao {
 }
 
 @Database(
-    entities = [ChatItem::class, TurnRow::class, MemoryRow::class, GoalRow::class, TaskRow::class, TriggerRow::class, NotificationRow::class],
+    entities = [ChatItem::class, TurnRow::class, ChatThread::class, MemoryRow::class, GoalRow::class, TaskRow::class, TriggerRow::class, NotificationRow::class],
     version = 2,
     exportSchema = true,
 )
 abstract class AppDb : RoomDatabase() {
     abstract fun chat(): ChatDao
+    abstract fun chats(): ChatsDao
     abstract fun memory(): MemoryDao
     abstract fun tasks(): TaskDao
     abstract fun triggers(): TriggerDao

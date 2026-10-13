@@ -159,6 +159,63 @@ class ScheduleListTool(private val dao: TriggerDao) : Tool {
         dao.list().joinToString("\n") { "#${it.id} ${it.name} [${it.kind} ${it.spec}]${if (!it.enabled) " (paused)" else ""}: ${it.prompt.take(100)}" }.ifBlank { "No routines." }
 }
 
+/**
+ * Multi-chat (Muse-style threads): let the main agent organize chats — start a fresh one when the
+ * user changes subject, list them, rename/pin/archive/delete. Helpers never get these.
+ */
+class ChatListTool(private val chats: suspend () -> List<com.past9.phoneaos.data.ChatThread>, private val active: () -> String) : Tool {
+    override val spec = ToolSpec("chat_list", "List the user's chats (threads), newest first. The active one is marked.", schema())
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val a = active()
+        return chats().joinToString("\n") { "${if (it.id == a) "*" else " "} ${it.id} \"${it.title}\"${if (it.pinned) " [pinned]" else ""}${if (it.archived) " [archived]" else ""}" }
+            .ifBlank { "No chats." }
+    }
+}
+
+class ChatNewTool(private val new: suspend (String) -> String) : Tool {
+    override val spec = ToolSpec("chat_new", "Start a fresh chat and switch to it. Use when the user changes subject, so topics never mix.",
+        schema(listOf(), "title" to str("Short title for the new chat, e.g. 'Trip to Cape Town'")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val id = new(input.optString("title").ifBlank { "New chat" })
+        return "Started chat \"$id\". Continue the conversation there."
+    }
+}
+
+class ChatSwitchTool(private val switch: suspend (String) -> Boolean) : Tool {
+    override val spec = ToolSpec("chat_switch", "Switch to another chat by id (see chat_list).",
+        schema(listOf("id"), "id" to str("Chat id")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String =
+        if (switch(input.optString("id"))) "Switched. Continue there." else "No chat with that id. Use chat_list."
+}
+
+class ChatRenameTool(private val rename: suspend (String, String) -> Boolean) : Tool {
+    override val spec = ToolSpec("chat_rename", "Rename a chat (default: the active one).",
+        schema(listOf("title"), "id" to str("Chat id, blank for the active chat"), "title" to str("New title")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String =
+        if (rename(input.optString("id"), input.optString("title"))) "Renamed." else "No chat with that id."
+}
+
+class ChatPinTool(private val pin: suspend (String, Boolean) -> Boolean) : Tool {
+    override val spec = ToolSpec("chat_pin", "Pin or unpin a chat so it stays at the top of the list.",
+        schema(listOf("id", "pinned"), "id" to str("Chat id"), "pinned" to bool("True to pin, false to unpin")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String =
+        if (pin(input.optString("id"), input.optBoolean("pinned", true))) "Done." else "No chat with that id."
+}
+
+class ChatArchiveTool(private val archive: suspend (String, Boolean) -> Boolean) : Tool {
+    override val spec = ToolSpec("chat_archive", "Archive (hide) or restore a chat. The main chat can't be archived.",
+        schema(listOf("id", "archived"), "id" to str("Chat id"), "archived" to bool("True to archive, false to restore")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String =
+        if (archive(input.optString("id"), input.optBoolean("archived", true))) "Done." else "Couldn't archive that chat (the main chat stays)."
+}
+
+class ChatDeleteTool(private val delete: suspend (String) -> Boolean) : Tool {
+    override val spec = ToolSpec("chat_delete", "Delete a chat and its whole history. The main chat can't be deleted.",
+        schema(listOf("id"), "id" to str("Chat id")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String =
+        if (delete(input.optString("id"))) "Deleted." else "Couldn't delete that chat (the main chat stays)."
+}
+
 class ScheduleDeleteTool(private val dao: TriggerDao, private val onDelete: suspend (Long) -> Unit) : Tool {
     override val spec = ToolSpec("routine_delete", "Delete a routine by id.", schema(listOf("id"), "id" to int("Routine id")))
     override suspend fun run(input: JSONObject, ctx: ToolContext): String {

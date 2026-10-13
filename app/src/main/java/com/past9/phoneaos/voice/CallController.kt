@@ -73,7 +73,8 @@ class CallController(private val context: Context, private val db: AppDb, privat
     /** Gives the voice the last stretch of the chat and the user's pinned facts, so it picks up mid-thread. */
     private suspend fun begin(key: String, base: String) {
         val s = settings.state.value
-        val recent = db.chat().all().first().filter { it.kind == "user" || it.kind == "agent" }.takeLast(10)
+        val chat = settings.activeChat()
+        val recent = db.chat().all().first().filter { it.chatId == chat && (it.kind == "user" || it.kind == "agent") }.takeLast(10)
             .joinToString("\n") { (if (it.kind == "user") "User: " else "You: ") + it.text.take(400) }
         val pinned = db.memory().pinned().joinToString("\n") { "- ${it.title}: ${it.body.take(200)}" }
         val system = base + (if (pinned.isNotBlank()) "\n\nWhat you know about them:\n$pinned" else "") +
@@ -84,7 +85,7 @@ class CallController(private val context: Context, private val db: AppDb, privat
         watcher = scope.launch {
             var last = db.chat().all().first().lastOrNull()?.id ?: 0L
             db.chat().all().collect { items ->
-                items.filter { it.id > last && !JSONObject(it.meta).optBoolean("call") }.forEach { i ->
+                items.filter { it.chatId == chat && it.id > last && !JSONObject(it.meta).optBoolean("call") }.forEach { i ->
                     when (i.kind) {
                         "agent" -> live?.announce("[Update from the main agent, tell the user briefly] ${i.text.take(1200)}")
                         "question" -> {
@@ -168,7 +169,7 @@ class CallController(private val context: Context, private val db: AppDb, privat
                     live?.sendToolResult(e.id, e.name, res)
                 }
                 "agent_status" -> scope.launch {
-                    val lastAgent = db.chat().all().first().lastOrNull { it.kind == "agent" }?.text.orEmpty()
+                    val lastAgent = db.chat().all().first().lastOrNull { it.chatId == settings.activeChat() && it.kind == "agent" }?.text.orEmpty()
                     val stNow = runtime.status.value
                     live?.sendToolResult(e.id, e.name, JSONObject().put("working", stNow.working).put("doing", stNow.label).put("last_message", lastAgent.take(800)))
                 }

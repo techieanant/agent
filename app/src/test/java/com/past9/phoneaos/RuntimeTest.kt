@@ -212,6 +212,7 @@ class RuntimeTest {
         assertTrue(sys.contains("hard limit of 5 action steps"))
         assertTrue(sys.contains("ASSUME YOU ALREADY KNOW"))
         assertFalse(sys.contains("You are a HELPER"))
+        assertTrue(sys.contains("separate chats (threads)"))
         assertTrue(rt.systemPrompt("x", role = PromptRole.HELPER).contains("You are a HELPER"))
     }
 

@@ -92,6 +92,10 @@ data class ChatActions(
     val onStopSpeaking: (() -> Unit)? = null,
     /** Open a report (its file path) in the full-screen reader. */
     val onReport: (String) -> Unit = {},
+    /** Open the thread list (multi-chat). Null hides the button. */
+    val onThreads: (() -> Unit)? = null,
+    /** Unread messages waiting in other chats, for the thread-list badge. */
+    val threadBadges: Int = 0,
 )
 
 /**
@@ -177,6 +181,8 @@ fun ChatScreen(
     modelLabel: String = "",
     docs: List<String> = emptyList(),
     morning: MorningUi? = null,
+    /** Title of the chat thread on screen (the top bar shows it instead of the agent name). */
+    chatTitle: String = "",
     /** Newest message id he had seen when he last looked at the chat (Long.MAX_VALUE: first run, nothing is unread). */
     readMark: () -> Long = { Long.MAX_VALUE },
     onRead: (Long) -> Unit = {},
@@ -264,7 +270,7 @@ fun ChatScreen(
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.surface,
-        topBar = { ChatTopBar(agentName, status, browserLive, waitingOnYou, openCount, actions, modelLabel) },
+        topBar = { ChatTopBar(chatTitle, agentName, status, browserLive, waitingOnYou, openCount, actions, modelLabel) },
         bottomBar = { Composer(draft, onDraft, status.working, actions, attachments, docs, listening) },
     ) { pad ->
         if (items.isEmpty() || morning != null) Welcome(userName, Modifier.padding(pad), actions.onSend, morning, hasChat = items.isNotEmpty())
@@ -325,15 +331,20 @@ private fun NewMarker(count: Int) {
 }
 
 @Composable
-private fun ChatTopBar(agentName: String, status: AgentStatus, browserLive: Boolean, needsYou: Boolean, openCount: Int, actions: ChatActions, modelLabel: String = "") {
+private fun ChatTopBar(chatTitle: String, agentName: String, status: AgentStatus, browserLive: Boolean, needsYou: Boolean, openCount: Int, actions: ChatActions, modelLabel: String = "") {
     Surface(color = MaterialTheme.colorScheme.surface) {
         Row(Modifier.fillMaxWidth().statusBarsPadding().padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = actions.onMenu) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back to home") }
+            if (actions.onThreads != null) {
+                BadgedBox(badge = { if (actions.threadBadges > 0) Badge { Text(if (actions.threadBadges > 9) "9+" else actions.threadBadges.toString()) } }) {
+                    IconButton(onClick = actions.onThreads) { Icon(Icons.Rounded.Forum, "Chats") }
+                }
+            }
             Row(Modifier.weight(1f).clip(MaterialTheme.shapes.medium).clickable(onClick = actions.onProfile).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             AgentAvatar(working = status.working, needsYou = needsYou, size = 36.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(agentName, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(chatTitle.ifBlank { agentName }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 val line = when {
                     needsYou -> "Waiting for you"
                     status.working -> status.label + if (status.helpers > 0) " · ${status.helpers} helper${if (status.helpers > 1) "s" else ""}" else ""

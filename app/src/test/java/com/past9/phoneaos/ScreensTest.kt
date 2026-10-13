@@ -91,7 +91,20 @@ class ScreensTest(private val dark: Boolean) {
     @Test fun onboardingApps() { shot("04-onboarding-apps") { OnboardingScreen(OnboardingActions(), start = OnbStep.APPS) } }
 
     @Test fun chatEmpty() { shot("10-chat-empty") { ChatScreen(emptyList(), AgentStatus(), "Your agent", "Sam", false, "", {}, ChatActions()) } }
-    @Test fun chatBusy() { shot("11-chat-working") { ChatScreen(conversation.dropLast(1), AgentStatus(true, "Browsing", 1), "Nova", "Sam", true, "", {}, ChatActions(), openCount = 3) } }
+    @Test fun threadsSheet() {
+        val now = System.currentTimeMillis()
+        shot("17-threads") {
+            com.past9.phoneaos.ui.screens.ThreadsSheet(
+                rows = listOf(
+                    com.past9.phoneaos.ui.screens.ThreadRow(com.past9.phoneaos.data.ChatThread("main", "Main chat", updatedAt = now), "Window seats from now on", 0, true),
+                    com.past9.phoneaos.ui.screens.ThreadRow(com.past9.phoneaos.data.ChatThread("c12ab34cd", "Trip to Cape Town", pinned = true, updatedAt = now - 3_600_000), "FlySafair 06:05, R 899", 2, false),
+                    com.past9.phoneaos.ui.screens.ThreadRow(com.past9.phoneaos.data.ChatThread("c56ef78ab", "Kindle price watch", updatedAt = now - 86_400_000), "R 2,499 at Takealot", 0, false),
+                    com.past9.phoneaos.ui.screens.ThreadRow(com.past9.phoneaos.data.ChatThread("c90ab12cd", "Old visa questions", archived = true, updatedAt = now - 7 * 86_400_000), "Do I need a visa?", 0, false),
+                ),
+                onPick = {}, onNew = {}, onRename = { _, _ -> }, onPin = { _, _ -> }, onArchive = { _, _ -> }, onDelete = {}, onDismiss = {},
+            )
+        }
+    }
     @Test fun chatApproval() { shot("12-chat-approval") { ChatScreen(conversation, AgentStatus(true, "Waiting for you"), "Nova", "Sam", true, "Also check", {}, ChatActions(), openCount = 3) } }
     @Test fun chatQuestion() {
         val items = listOf(

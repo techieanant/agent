@@ -282,10 +282,10 @@ class BranchingTest {
     // ---- restart ---------------------------------------------------------------------------
 
     @Test fun aBranchCutOffByARestartIsMergedCleanlyWithWhatItDid() = runBlocking {
-        val id = db.chat().insert(ChatItem(kind = "branch", text = "find me a plumber", meta = JSONObject().put("state", "running").put("relation", "parallel").put("parent", "main").put("origin", 5).toString()))
-        db.chat().insertTurn(TurnRow(thread = "branch-$id", json = Msg.user("[You were forked...]\n\nfind me a plumber").toJson().toString()))
-        db.chat().insertTurn(TurnRow(thread = "branch-$id", json = call("web_fetch", JSONObject().put("url", "https://plumbers.example"), "c1").toJson().toString()))
-        db.chat().insertTurn(TurnRow(thread = "branch-$id", json = Msg(Role.USER, listOf(Block.ToolResult("c1", "Pipe Dreams, 021 555 0100"))).toJson().toString()))
+        val id = db.chat().insert(ChatItem(kind = "branch", text = "find me a plumber", chatId = "main", meta = JSONObject().put("state", "running").put("relation", "parallel").put("parent", "main").put("origin", 5).toString()))
+        db.chat().insertTurn(TurnRow(thread = "main/b$id", json = Msg.user("[You were forked...]\n\nfind me a plumber").toJson().toString()))
+        db.chat().insertTurn(TurnRow(thread = "main/b$id", json = call("web_fetch", JSONObject().put("url", "https://plumbers.example"), "c1").toJson().toString()))
+        db.chat().insertTurn(TurnRow(thread = "main/b$id", json = Msg(Role.USER, listOf(Block.ToolResult("c1", "Pipe Dreams, 021 555 0100"))).toJson().toString()))
         val rt = runtime(BranchProvider())      // a fresh process on the same database
         idle(rt)
         val row = db.chat().get(id)!!
@@ -293,7 +293,7 @@ class BranchingTest {
         assertTrue(chat().any { it.kind == "notice" && it.text.contains("find me a plumber") })
         val note = mainTurns().single { it.text.startsWith("[Branch merge") }.text
         assertTrue(note.contains("interrupted") && note.contains("Pipe Dreams") && note.contains("web_fetch"))
-        assertTrue("its working transcript is cleared once merged", db.chat().recentTurns("branch-$id", 10).isEmpty())
+        assertTrue("its working transcript is cleared once merged", db.chat().recentTurns("main/b$id", 10).isEmpty())
     }
 
     // ---- subscription mode: Claude forks the running session --------------------------------

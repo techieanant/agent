@@ -116,6 +116,15 @@ class AgentRuntime(
     private val mainLine = Line("main", lineSeq.incrementAndGet())
     private val mainTurn = Turn(mainLine)
     private val mainBudget get() = mainLine.budget
+    /** Multi-chat (Muse-style threads): the chat the user is looking at. Every visible row and every
+     *  model transcript thread is scoped to it; helpers report back to the chat that started them. */
+    fun activeChat(): String = settings.activeChat()
+    /** Make sure the "main" chat row exists (fresh installs, and upgrades from before multi-chat). */
+    private fun ensureMainChat() = scope.launch { db.chats().insert(com.past9.phoneaos.data.ChatThread()) }
+    /** A branch folds back into the chat its row lives in, not the global line. */
+    private fun branchChat(b: Branch): String = runCatching {
+        kotlinx.coroutines.runBlocking { db.chat().get(b.item)?.chatId } ?: activeChat()
+    }.getOrDefault(activeChat())
     /** Lines whose turn is running (or queued) right now. A message sent while any is non-empty forks instead of waiting. */
     private val activeLines = ConcurrentHashMap<String, Line>()
     private val mainPending = java.util.concurrent.atomic.AtomicInteger()
@@ -165,7 +174,7 @@ class AgentRuntime(
     private val _running = MutableStateFlow<List<HelperRun>>(emptyList())
     val running: StateFlow<List<HelperRun>> = _running
     /** Helper results waiting for the main agent to read them (with the helper whose request it is, for a request). */
-    private data class Inbound(val note: String, val origin: Long?, val escalation: Long? = null)
+    private data class Inbound(val note: String, val origin: Long?, val escalation: Long? = null, val chat: String = "main")
     private val inbox = java.util.concurrent.ConcurrentLinkedQueue<Inbound>()
     private val resumeLock = Mutex()
     /** Helpers the database says are still working (for the safety-net check). */
@@ -234,7 +243,7 @@ class AgentRuntime(
             val rows = db.chat().all().first().filter { it.kind == "branch" }
             rows.filter { JSONObject(it.meta).optString("state") == "running" }.forEach { r ->
                 db.chat().update(r.copy(meta = JSONObject(r.meta).put("state", "interrupted").put("error", "Interrupted when the app closed.").toString()))
-                db.chat().insert(ChatItem(kind = "notice", text = "I was partway through \"${r.text.take(80)}\" when the app closed. Tell me to carry on and I will."))
+                db.chat().insert(ChatItem(kind = "notice", text = "I was partway through \"${r.text.take(80)}\" when the app closed. Tell me to carry on and I will.", chatId = r.chatId))
             }
             unmerged.set(rows.count { !JSONObject(it.meta).optBoolean("merged") })
             if (unmerged.get() > 0) mergeBranches()
@@ -283,7 +292,7 @@ class AgentRuntime(
             meta.optString("profile").takeIf { it.isNotBlank() }?.let { n -> profiles.find(n)?.let { helperProfile[row.id] = it.id } }
             meta.put("state", "working").remove("result")
             db.chat().update(row.copy(meta = meta.put("resumes", tries + 1).put("totalResumes", meta.optInt("totalResumes") + 1).put("stepsAtResume", steps).put("startedAt", System.currentTimeMillis()).toString()))
-            db.chat().insert(ChatItem(kind = "activity", text = "Picked up again after the app restarted", meta = JSONObject().put("tool", "agent").put("by", label).put("helper", row.id).toString()))
+            db.chat().insert(ChatItem(kind = "activity", text = "Picked up again after the app restarted", chatId = row.chatId, meta = JSONObject().put("tool", "agent").put("by", label).put("helper", row.id).toString()))
             val saved = HelperCheckpoint.load(db, row.id)
             val history: MutableList<Msg>; val prompt: String
             if (sub != null) {
@@ -299,11 +308,11 @@ class AgentRuntime(
                 prompt = history.first().text
             }
             picked += "#${row.id} \"$label\" (${steps} steps in)"
-            launchHelper(row.id, label, history, prompt, if (sub != null) session else null, provider, sub, meta.optString("model"), brief = row.text)
+            launchHelper(row.id, label, history, prompt, if (sub != null) session else null, provider, sub, meta.optString("model"), brief = row.text, chat = row.chatId)
         }
         if (picked.isNotEmpty()) {
             val list = picked.joinToString("; ")
-            db.chat().insert(ChatItem(kind = "notice", text = "The app restarted. ${picked.size} helper${if (picked.size > 1) "s" else ""} picked up where ${if (picked.size > 1) "they" else "it"} left off."))
+            db.chat().insert(ChatItem(kind = "notice", text = "The app restarted. ${picked.size} helper${if (picked.size > 1) "s" else ""} picked up where ${if (picked.size > 1) "they" else "it"} left off.", chatId = cut.firstOrNull()?.chatId ?: "main"))
             // The main agent hears it too, so it doesn't brief them again or tell the user they were lost.
             deliver("[The app restarted. These helpers were cut off and have been resumed from their last checkpoint: $list. They carry on by themselves; don't start them again. Their results arrive as usual. Say nothing to the user unless it matters.]")
         }
@@ -328,8 +337,15 @@ class AgentRuntime(
             TaskListTool(db.tasks()), TaskAddTool(db.tasks()), TaskUpdateTool(db.tasks()), GoalCreateTool(db.tasks()),
             NotificationsTool(db.notifications()) { settings.state.value.notifApps },
             ScheduleListTool(db.triggers()),
-            AskUserTool(), NotifyTool(), VoiceNoteTool(context, settings, db.chat()),
-            com.past9.phoneaos.tools.ReportTool(context) { item -> db.chat().insert(item.copy(meta = JSONObject(item.meta).apply { replyMeta(turn, this) }.toString())) },
+            com.past9.phoneaos.tools.ChatListTool({ db.chats().list() }, { activeChat() }),
+            com.past9.phoneaos.tools.ChatNewTool { newChat(it) },
+            com.past9.phoneaos.tools.ChatSwitchTool { switchChat(it) },
+            com.past9.phoneaos.tools.ChatRenameTool { id, title -> renameChat(id.ifBlank { activeChat() }, title) },
+            com.past9.phoneaos.tools.ChatPinTool { id, pinned -> pinChat(id, pinned) },
+            com.past9.phoneaos.tools.ChatArchiveTool { id, archived -> archiveChat(id, archived) },
+            com.past9.phoneaos.tools.ChatDeleteTool { deleteChat(it) },
+            AskUserTool(), NotifyTool(), VoiceNoteTool(context, settings, db.chat(), ::activeChat),
+            com.past9.phoneaos.tools.ReportTool(context) { item -> db.chat().insert(item.copy(chatId = activeChat(), meta = JSONObject(item.meta).apply { replyMeta(turn, this) }.toString())) },
             DelegateTool { task, label, model, profile, batch, pinned -> startHelper(task, label, model, profile, batch, pinned, turn) },
             HelperSteerTool { id, message, restart -> steerHelper(id, message, restart) },
             HelperPushTool { id, message -> pushHelper(id, message) },
@@ -400,7 +416,7 @@ class AgentRuntime(
         val main = role == PromptRole.MAIN
         return buildString {
             if (s.agentName != "Your agent") appendLine(if (main) "Your name is ${s.agentName}." else "You work for ${s.agentName}, the user's personal agent.")
-            if (main) appendLine("You are the user's personal agent, living on their Android phone. One agent, one ongoing conversation.")
+            if (main) appendLine("You are the user's personal agent, living on their Android phone. One agent, many chats; this prompt is for the chat you're in now.")
             else appendLine("You are a worker for the user's personal agent on their Android phone. You get things done: find, fetch, book, send, build, follow up.")
             if (s.userName.isNotBlank()) appendLine("The user's name is ${s.userName}.")
             appendLine("Now: ${now.format(DateTimeFormatter.ofPattern("EEEE d MMMM yyyy, HH:mm"))} (${now.zone}). Always resolve 'today', 'tomorrow', '10am' in THIS timezone and read concrete dates back to the user.")
@@ -450,6 +466,7 @@ class AgentRuntime(
                     }
                 }
                 appendLine("- ASSUME YOU ALREADY KNOW. Before asking the user anything, search memory (memory_search, then memory_get). Ask (ask_user, with buttons) only when you've checked and truly don't know, or it's a choice only they can make. Needless questions annoy them.")
+                appendLine("- CHATS: the user keeps separate chats (threads), one topic each. You only ever see this chat's history (chat_list shows the others). When the user changes subject, start a fresh chat with chat_new (short title) instead of mixing topics. chat_rename, chat_pin, chat_archive and chat_delete keep the list tidy. The original chat is never deleted.")
                 appendLine("- Memory is your wiki about the user's life: one page per person, company, place, project or preference, in markdown, linking other pages as [[Name]], always tagged. Whenever you learn something durable (from them or from a helper's result), save or update the page right away (memory_get first to merge). Keep pages accurate and fix wrong ones. This is the most important thing you do.")
                 appendLine("- The user uses you as their to-do list. Things THEY must do or asked to be reminded of go on their list (task_add owner user). The work you hand out lives under goals (goal_create) with a task per step; tick them off as helper results come in, and when stuck mark the step blocked and say what would unblock it.")
                 appendLine("- Routines: you come up with the ideas (a morning brief, watching a price, chasing a reply) and suggest them. When the user agrees, a helper creates it: delegate with the exact schedule and the instruction the routine should run. routine_list shows what exists.")
@@ -528,7 +545,7 @@ class AgentRuntime(
         if (fromCall == null && images.isEmpty() && files.isEmpty() && mainQuestions.isNotEmpty()) {
             val id = mainQuestions.maxOrNull()
             if (id != null) {
-                scope.launch { db.chat().insert(ChatItem(kind = "user", text = clean)) }
+                scope.launch { db.chat().insert(ChatItem(kind = "user", text = clean, chatId = activeChat())) }
                 answer(id, clean)
                 return
             }
@@ -545,9 +562,15 @@ class AgentRuntime(
     private suspend fun admit(clean: String, images: List<String>, files: List<String>, voiceReply: Boolean, fromCall: String?) {
         val target = if (fromCall == null) activeLines.values.maxByOrNull { it.seq } else null
         val rel = target?.let { branchPolicy.classify(clean, it.userText) }
-        val origin = if (fromCall != null) { db.chat().insert(ChatItem(kind = "activity", text = "On it: $fromCall", meta = JSONObject().put("tool", "call").toString())); null }
-        else db.chat().insert(ChatItem(kind = "user", text = clean, meta = JSONObject().put("images", org.json.JSONArray(images.filter { !it.contains("/pdf-") }))
+        val chat = activeChat()
+        val origin = if (fromCall != null) { sayIn(chat, "activity", "On it: $fromCall", JSONObject().put("tool", "call")); null }
+        else db.chat().insert(ChatItem(kind = "user", text = clean, chatId = chat, meta = JSONObject().put("images", org.json.JSONArray(images.filter { !it.contains("/pdf-") }))
             .put("files", org.json.JSONArray(files)).put("voiceReply", voiceReply).toString()))
+        touchChat(chat)
+        // A fresh chat names itself from its first message (Muse's thread titles from snippets).
+        if (fromCall == null) db.chats().get(chat)?.takeIf { it.title == "Main chat" || it.title == "New chat" }?.let {
+            db.chats().update(it.copy(title = clean.take(60)))
+        }
         val forModel = if (voiceReply) "$clean\n\n(The user is on the move: answer with a voice_note, then at most one short line of text. Don't repeat the voice note as text.)" else clean
         if (target == null || rel == null) {
             mainLine.userText = clean
@@ -564,12 +587,12 @@ class AgentRuntime(
 
     /** Fork the running line's current state into a new agent that starts on the new message at once. */
     private suspend fun startBranch(parent: Line, rel: Relation, text: String, forModel: String, images: List<String>, originId: Long) {
-        val itemId = db.chat().insert(ChatItem(kind = "branch", text = text, meta = JSONObject().put("state", "running").put("relation", rel.word)
+        val itemId = db.chat().insert(ChatItem(kind = "branch", text = text, chatId = activeChat(), meta = JSONObject().put("state", "running").put("relation", rel.word)
             .put("parent", parent.id).put("origin", originId).put("startedAt", System.currentTimeMillis()).toString()))
         val line = Line("b$itemId", lineSeq.incrementAndGet()).also { it.userText = text }
         val b = Branch(itemId, line, parent, rel, originId, text).also { it.turn.origin = originId }
         branches[itemId] = b
-        branchCtx[itemId] = ChatContext("branch-$itemId", interactive = true, branchItem = itemId, display = "Side thread")
+        branchCtx[itemId] = ChatContext("branch-$itemId", interactive = true, branchItem = itemId, display = "Side thread", chat = activeChat())
         b.turns.incrementAndGet(); activeLines[line.id] = line
         unmerged.incrementAndGet()
         // Fork from where the working line is RIGHT NOW, then (for a correction) close it: its work so far is kept.
@@ -604,8 +627,8 @@ class AgentRuntime(
     }
 
     /** A helper's result goes to the branch that started it while that branch lives; otherwise to the main agent. */
-    private fun deliverFor(branchId: Long?, note: String, origin: Long?) {
-        val b = branchId?.let { branches[it] } ?: return deliver(note, origin)
+    private fun deliverFor(branchId: Long?, note: String, origin: Long?, chat: String? = null) {
+        val b = branchId?.let { branches[it] } ?: return deliver(note, origin, chat = chat)
         b.turns.incrementAndGet(); activeLines[b.line.id] = b.line
         launchTurn {
             try { runBranchTurn(b, note, emptyList(), first = false) }
@@ -614,13 +637,21 @@ class AgentRuntime(
     }
 
     /** A helper's result goes back to the main agent as a new message (batched if several land together). */
-    private fun deliver(note: String, origin: Long? = null, escalation: Long? = null) {
-        inbox += Inbound(note, origin, escalation)
+    private fun deliver(note: String, origin: Long? = null, escalation: Long? = null, chat: String? = null) {
+        inbox += Inbound(note, origin, escalation, chat ?: activeChat())
         launchMain {
             turnLock.withLock {
                 val batch = generateSequence { inbox.poll() }.toList()
                 // The reply quotes the message that asked for this work (the newest, if several landed together).
-                if (batch.isNotEmpty()) runTurn(batch.joinToString("\n\n") { it.note }, fromUser = false, replyTo = batch.mapNotNull { it.origin }.maxOrNull())
+                if (batch.isNotEmpty()) {
+                    // A result for another chat runs there (its reply lands in that chat, with an unread badge).
+                    val mine = batch.filter { it.chat == activeChat() }
+                    val other = batch.filter { it.chat != activeChat() }
+                    if (mine.isNotEmpty()) runTurn(mine.joinToString("\n\n") { it.note }, fromUser = false, replyTo = mine.mapNotNull { it.origin }.maxOrNull())
+                    other.groupBy { it.chat }.forEach { (c, notes) ->
+                        runTurnIn(c, notes.joinToString("\n\n") { it.note }, fromUser = false, replyTo = notes.mapNotNull { it.origin }.maxOrNull())
+                    }
+                }
                 batch.mapNotNull { it.escalation }.forEach { untriaged(it) }
             }
         }
@@ -653,27 +684,27 @@ class AgentRuntime(
             _status.value = _status.value.copy(working = true, label = "Thinking", helpers = helpers.size); phone.workStarted()
             try {
                 val sub = subscription?.takeIf { settings.state.value.mode == PowerMode.SUBSCRIPTION && it.ready }
-                if (sub != null) branchSub(b, sub, text, images, first, parentSession) else branchApi(b, text, images, first, base)
+                if (sub != null) branchSub(b, sub, text, images, first, parentSession) else branchApi(b, text, images, first, base, branchChat(b))
             } catch (e: CancellationException) {
                 b.outcome = if (line.supersededBy != null) "superseded" else "stopped"
-                if (line.supersededBy == null) db.chat().insert(ChatItem(kind = "notice", text = "Stopped.", meta = JSONObject().put("branch", b.item).toString()))
+                if (line.supersededBy == null) sayIn(branchChat(b), "notice", "Stopped.", JSONObject().put("branch", b.item))
             } catch (e: Exception) {
                 b.outcome = "failed"; b.error = friendlyError(e)
-                db.chat().insert(ChatItem(kind = "notice", text = "A side thread (\"${b.userText.take(50)}\") failed: ${friendlyError(e)}", meta = JSONObject().put("error", true).put("branch", b.item).toString()))
+                sayIn(branchChat(b), "notice", "A side thread (\"${b.userText.take(50)}\") failed: ${friendlyError(e)}", JSONObject().put("error", true).put("branch", b.item))
             } finally { phone.workFinished() }
         }
     }
 
-    private suspend fun branchApi(b: Branch, text: String, images: List<String>, first: Boolean, base: List<Msg>) {
+    private suspend fun branchApi(b: Branch, text: String, images: List<String>, first: Boolean, base: List<Msg>, chat: String) {
         val provider = providerFactory(settings) ?: error(if (settings.state.value.mode == PowerMode.SUBSCRIPTION) "Your ${settings.state.value.subKind.label} subscription isn't set up on this phone yet." else "Add an API key in Settings.")
-        val thread = "branch-${b.item}"
+        val thread = "$chat/b${b.item}"
         if (first) {
             // Forked from the parent's transcript as it stands. If it hasn't got going yet, use what is saved.
             var from = base
-            if (from.isEmpty()) from = kotlinx.coroutines.withTimeoutOrNull(1500) { while (b.parent.snapshot.isEmpty()) kotlinx.coroutines.delay(20); b.parent.snapshot } ?: loadHistory("main")
+            if (from.isEmpty()) from = kotlinx.coroutines.withTimeoutOrNull(1500) { while (b.parent.snapshot.isEmpty()) kotlinx.coroutines.delay(20); b.parent.snapshot } ?: loadHistory(chat)
             b.history = Branching.fork(from)
         }
-        val history = b.history ?: loadHistory("main").also { b.history = it }
+        val history = b.history ?: loadHistory(chat).also { b.history = it }
         val msg = Msg.user(if (first) Branching.framed(text, b.relation, b.parent.userText) else text, if (first) images else emptyList())
         history += msg; db.chat().insertTurn(TurnRow(thread = thread, json = msg.toJson().toString())); b.line.snapshot = history.toList()
         val ctx = branchCtx.getValue(b.item)
@@ -741,21 +772,21 @@ class AgentRuntime(
             if (m.optBoolean("merged")) continue
             if (m.optString("state") == "running") break
             val state = m.optString("state")
-            val delta = db.chat().recentTurns("branch-${row.id}", 500).reversed().mapNotNull { runCatching { Msg.fromJson(JSONObject(it.json)) }.getOrNull() }
+            val delta = db.chat().recentTurns("${row.chatId}/b${row.id}", 500).reversed().mapNotNull { runCatching { Msg.fromJson(JSONObject(it.json)) }.getOrNull() }
             var (steps, said) = Branching.digest(delta)
             if (delta.isEmpty()) {
                 val mine = db.chat().all().first().filter { JSONObject(it.meta).optLong("branch") == row.id }
                 steps = mine.filter { it.kind == "activity" }.map { it.text }
                 said = mine.filter { it.kind == "agent" }.map { it.text }
             }
-            // An adopted correction already lives in the main session; everything else is written into the main line.
+            // An adopted correction already lives in the main session; everything else is written into the branch's own chat, never the global line.
             if (!(m.optBoolean("adopt") && sub && state == "done")) {
                 val note = Branching.mergeNote(row.id.toInt(), runCatching { Relation.valueOf(m.optString("relation").uppercase()) }.getOrDefault(Relation.PARALLEL),
                     state, row.text, steps, said, m.optString("error").takeIf { it.isNotBlank() })
-                if (sub) pendingAdd(note) else db.chat().insertTurn(TurnRow(thread = "main", json = Msg.user(note).toJson().toString()))
+                if (sub) pendingAdd(note) else db.chat().insertTurn(TurnRow(thread = row.chatId, json = Msg.user(note).toJson().toString()))
             }
             db.chat().update(row.copy(meta = m.put("merged", true).put("mergedAt", System.currentTimeMillis()).toString()))
-            db.chat().clearTurns("branch-${row.id}")
+            db.chat().clearTurns("${row.chatId}/b${row.id}")
             unmerged.updateAndGet { (it - 1).coerceAtLeast(0) }
         }
     }
@@ -779,7 +810,7 @@ class AgentRuntime(
     /** A finished voice call goes into the agent's own history, so the chat carries on from it. */
     fun rememberCall(transcript: String) = scope.launch {
         if (transcript.isBlank()) return@launch
-        db.chat().insertTurn(TurnRow(thread = "main", json = Msg.user("[Earlier, on a voice call with you]\n$transcript").toJson().toString()))
+        db.chat().insertTurn(TurnRow(thread = activeChat(), json = Msg.user("[Earlier, on a voice call with you]\n$transcript").toJson().toString()))
     }
 
     /** Wait until the main agent and every helper are done, including the turns their results start. */
@@ -882,25 +913,33 @@ class AgentRuntime(
         }
     }
 
+    /** A turn on a chat that isn't on screen (a helper's result for another chat): scoped to it end to end. */
+    private suspend fun runTurnIn(chat: String, userText: String, images: List<String> = emptyList(), fromUser: Boolean = false, replyTo: Long? = null) {
+        val prev = settings.activeChat()
+        settings.setActiveChat(chat)
+        try { runTurn(userText, images, fromUser, replyTo) } finally { settings.setActiveChat(prev) }
+    }
+
     /** @param fromUser a message the user sent: it starts a fresh 5-step budget. A helper's result coming back doesn't. */
     private suspend fun runTurn(userText: String, images: List<String> = emptyList(), fromUser: Boolean = true, replyTo: Long? = null) {
         if (fromUser) mainBudget.used = 0
         mainTurn.origin = replyTo; mainTurn.late = !fromUser
         if (settings.state.value.mode == PowerMode.SUBSCRIPTION && subscription?.ready == true) return runSubscriptionTurn(userText, subscription!!, images)
+        val chat = activeChat()
         val provider = providerFactory(settings)
         if (provider == null) {
-            db.chat().insert(ChatItem(kind = "notice", text = if (settings.state.value.mode == PowerMode.SUBSCRIPTION)
-                "Your ${settings.state.value.subKind.label} subscription isn't set up on this phone yet. Open Settings to finish setup, or switch to an API key." else "Add an API key in Settings so I can start working."))
+            sayIn(chat, "notice", if (settings.state.value.mode == PowerMode.SUBSCRIPTION)
+                "Your ${settings.state.value.subKind.label} subscription isn't set up on this phone yet. Open Settings to finish setup, or switch to an API key." else "Add an API key in Settings so I can start working.")
             return
         }
         _status.value = _status.value.copy(working = true, label = "Thinking")
         phone.workStarted()
         mainLine.job = kotlin.coroutines.coroutineContext[Job]; mainLine.supersededBy = null
-        val history = loadHistory("main")
+        val history = loadHistory(chat)
         val first = Msg.user(userText, images)
-        history += first; db.chat().insertTurn(TurnRow(thread = "main", json = first.toJson().toString()))
+        history += first; db.chat().insertTurn(TurnRow(thread = chat, json = first.toJson().toString()))
         mainLine.snapshot = history.toList()
-        val ctx = ChatContext("main", interactive = true)
+        val ctx = ChatContext("main", interactive = true, chat = chat)
         try {
             val s = settings.state.value
             AgentLoop(provider, s.model, tools()).run(systemPrompt(userText), history, ctx,
@@ -912,23 +951,36 @@ class AgentRuntime(
                         is AgentEvent.ToolFinished -> {}
                     }
                 },
-                onAppend = { m -> db.chat().insertTurn(TurnRow(thread = "main", json = m.toJson().toString())); mainLine.snapshot = history.toList() },
+                onAppend = { m -> db.chat().insertTurn(TurnRow(thread = chat, json = m.toJson().toString())); mainLine.snapshot = history.toList() },
                 incoming = { generateSequence { mainLine.notes.poll() }.toList() })
         } catch (e: CancellationException) {
             // A correction closed this line: its work is kept, and the branch that replaced it carries on. That isn't "Stopped".
-            if (mainLine.supersededBy == null) db.chat().insert(ChatItem(kind = "notice", text = "Stopped."))
+            if (mainLine.supersededBy == null) sayIn(chat, "notice", "Stopped.")
         } catch (e: Exception) {
-            db.chat().insert(ChatItem(kind = "notice", text = friendlyError(e), meta = JSONObject().put("error", true).toString()))
+            sayIn(chat, "notice", friendlyError(e), JSONObject().put("error", true))
         } finally {
             lineEnded(mainLine)
             phone.workFinished()
         }
     }
 
-    /** The main agent said something: into the chat, quoting what it answers. "HOLD" means it chose to say nothing yet. */
+    /** The main agent said something: into the current chat, quoting what it answers. "HOLD" means it chose to say nothing yet. */
     private suspend fun say(text: String, turn: Turn = mainTurn) {
         if (isHold(text)) return
-        db.chat().insert(ChatItem(kind = "agent", text = text, meta = JSONObject().apply { replyMeta(turn, this) }.toString()))
+        db.chat().insert(ChatItem(kind = "agent", text = text, chatId = activeChat(), meta = JSONObject().apply { replyMeta(turn, this) }.toString()))
+        touchChat(activeChat())
+    }
+
+    /** A visible row lands in the current chat (not the global line): every row carries its chat. */
+    private suspend fun sayIn(chat: String, kind: String, text: String, meta: JSONObject = JSONObject()) {
+        db.chat().insert(ChatItem(kind = kind, text = text, chatId = chat, meta = meta.toString()))
+        touchChat(chat)
+    }
+
+    /** Bump a chat's recency so the thread list stays newest-first (Muse's moveActiveSessionToTop). */
+    private suspend fun touchChat(chat: String) {
+        db.chats().get(chat)?.let { db.chats().update(it.copy(updatedAt = System.currentTimeMillis())) }
+            ?: if (chat == "main") db.chats().insert(com.past9.phoneaos.data.ChatThread()) else Unit
     }
 
     /** What a reply carries so the chat can quote what it answers (and mark it as a branch's). */
@@ -943,6 +995,7 @@ class AgentRuntime(
     /** Stream a harness turn into the chat, for the main line or a branch (`turn` says whose replies and steps these are). */
     private suspend fun consumeSub(flow: kotlinx.coroutines.flow.Flow<JSONObject>, engine: SubscriptionEngine, turn: Turn, resumed: Boolean): SubResult {
         val r = SubResult()
+        val chat = activeChat()
         val tag = { m: JSONObject -> turn.branchItem?.let { m.put("branch", it) }; m }
         flow.collect { e ->
             when (e.optString("type")) {
@@ -951,7 +1004,7 @@ class AgentRuntime(
                     when {
                         t.contains("API Error: 401") || t.startsWith("Failed to authenticate") -> {}
                         // The harness's own error, not the agent talking: one plain line, not raw JSON.
-                        t.trimStart().startsWith("API Error:") -> { r.error = subError(t); db.chat().insert(ChatItem(kind = "notice", text = subError(t), meta = tag(JSONObject().put("error", true)).toString())) }
+                        t.trimStart().startsWith("API Error:") -> { r.error = subError(t); sayIn(chat, "notice", subError(t), tag(JSONObject().put("error", true))) }
                         else -> say(t, turn)
                     }
                 }
@@ -960,8 +1013,8 @@ class AgentRuntime(
                     _status.value = _status.value.copy(label = labelFor(name))
                     // Our own phone tools log themselves; show everything else (web search, the
                     // user's Claude connectors, Codex commands) as a live step too.
-                    if (phoneToolNames.none { it == name }) db.chat().insert(ChatItem(kind = "activity", text = describeExternalTool(name, e.optString("detail")),
-                        meta = tag(JSONObject().put("tool", toolGroup(name))).toString()))
+                    if (phoneToolNames.none { it == name }) sayIn(chat, "activity", describeExternalTool(name, e.optString("detail")),
+                        tag(JSONObject().put("tool", toolGroup(name))))
                 }
                 "done" -> r.ok = e.optBoolean("ok", true)
                 "error" -> {
@@ -970,13 +1023,13 @@ class AgentRuntime(
                         // The saved conversation is gone (new install, cleared data): start a fresh one.
                         m.contains("No conversation found", true) && resumed -> { r.retry = true }
                         m.contains("Invalid bearer token", true) || m.contains("authentication_error", true) || m.contains("401") -> {
-                            engine.forgetBadSignIn(); settings.setExtra("claude_session", null)
+                            engine.forgetBadSignIn(); settings.setChatSession(chat, null); if (chat == "main") settings.setExtra("claude_session", null)
                             r.error = "sign-in rejected"
-                            db.chat().insert(ChatItem(kind = "notice", text = "Your ${settings.state.value.subKind.label} sign-in didn't work. Open Settings, Subscription, and sign in again.", meta = tag(JSONObject().put("error", true)).toString()))
+                            sayIn(chat, "notice", "Your ${settings.state.value.subKind.label} sign-in didn't work. Open Settings, Subscription, and sign in again.", tag(JSONObject().put("error", true)))
                         }
                         // The same failure also came as text a moment ago: say it once.
                         m.contains("API Error:") -> {}
-                        m.isNotBlank() && !m.matches(Regex("exit \\d+")) -> { r.error = m.take(300); db.chat().insert(ChatItem(kind = "notice", text = "${settings.state.value.subKind.label}: " + m.take(300), meta = tag(JSONObject().put("error", true)).toString())) }
+                        m.isNotBlank() && !m.matches(Regex("exit \\d+")) -> { r.error = m.take(300); sayIn(chat, "notice", "${settings.state.value.subKind.label}: " + m.take(300), tag(JSONObject().put("error", true))) }
                     }
                 }
             }
@@ -988,7 +1041,8 @@ class AgentRuntime(
         _status.value = _status.value.copy(working = true, label = "Thinking"); phone.workStarted()
         mainLine.job = kotlin.coroutines.coroutineContext[Job]; mainLine.supersededBy = null
         try {
-            var resume = settings.extra("claude_session")
+            val chat = activeChat()
+            var resume = settings.chatSession(chat) ?: settings.extra("claude_session")
             for (attempt in 1..2) {
                 mainLine.session = resume
                 // What finished branches did, written in front of this prompt (a harness session can't be edited from outside).
@@ -996,15 +1050,15 @@ class AgentRuntime(
                 val prompt = if (merged.isEmpty()) userText else merged.joinToString("\n\n") + "\n\n" + userText
                 val r = consumeSub(engine.turn(prompt, systemPrompt(userText), resume, mcp.url, settings.localToken(), images, role = "main"), engine, mainTurn, resumed = resume != null)
                 // Only remember a conversation that actually worked, so a failed first turn can't poison the next.
-                if (r.ok && r.newSession != null) settings.setExtra("claude_session", r.newSession)
+                if (r.ok && r.newSession != null) { settings.setChatSession(chat, r.newSession); if (chat == "main") settings.setExtra("claude_session", r.newSession) }
                 if (r.ok) pendingDrop(merged.size)
-                if (r.retry && attempt == 1) { settings.setExtra("claude_session", null); resume = null; continue }
+                if (r.retry && attempt == 1) { settings.setChatSession(chat, null); if (chat == "main") settings.setExtra("claude_session", null); resume = null; continue }
                 break
             }
         } catch (e: CancellationException) {
-            if (mainLine.supersededBy == null) db.chat().insert(ChatItem(kind = "notice", text = "Stopped."))
+            if (mainLine.supersededBy == null) sayIn(activeChat(), "notice", "Stopped.")
         } catch (e: Exception) {
-            db.chat().insert(ChatItem(kind = "notice", text = friendlyError(e), meta = JSONObject().put("error", true).toString()))
+            sayIn(activeChat(), "notice", friendlyError(e), JSONObject().put("error", true))
         } finally { lineEnded(mainLine); phone.workFinished() }
     }
 
@@ -1051,7 +1105,7 @@ class AgentRuntime(
         val pick = wanted?.trim()?.takeIf { it.isNotEmpty() }?.let { w -> roster.firstOrNull { it.id.equals(w, true) } ?: roster.firstOrNull { it.name.equals(w, true) } }
         // A pinned agent stays on the model it was pinned on unless the main agent names another.
         val model = pick?.id?.ifBlank { null } ?: pin?.model?.ifBlank { null } ?: (pick ?: roster.first()).id.ifBlank { if (sub != null) st.subModel else st.model }
-        val itemId = db.chat().insert(ChatItem(kind = "helper", text = task, meta = JSONObject().put("label", label).put("state", "working")
+        val itemId = db.chat().insert(ChatItem(kind = "helper", text = task, chatId = activeChat(), meta = JSONObject().put("label", label).put("state", "working")
             .put("startedAt", System.currentTimeMillis()).put("model", model).apply {
                 put("profile", profile.name).put("profileColor", profile.color); turn.origin?.let { put("origin", it) }; turn.branchItem?.let { put("branch", it) }; batch?.let { put("batch", it) }
                 pin?.let { put("pinned", it.id).put("pinnedName", it.name) }
@@ -1061,19 +1115,19 @@ class AgentRuntime(
         turn.branchItem?.let { helperBranch[itemId] = it }
         if (profile.browser.isNotBlank()) com.past9.phoneaos.tools.BrowserTool.lastProfile["helper-$itemId"] = profile.browser
         batch?.let { helperBatch[itemId] = it }
-        if (pin == null) { launchHelper(itemId, label, mutableListOf(Msg.user(task)), task, null, provider, sub, model); return itemId }
+        if (pin == null) { launchHelper(itemId, label, mutableListOf(Msg.user(task)), task, null, provider, sub, model, chat = activeChat()); return itemId }
         val job = "[A new job from the main agent. You are ${pin.name}; your earlier work is above, so use what you learned.]\n$task"
         val history = pins.loadHistory(pin.id).also { com.past9.phoneaos.data.PinnedAgentStore.appendUser(it, job) }
         pins.put(pin.copy(lastHelper = itemId, lastUsedAt = System.currentTimeMillis()))
         pin.session?.let { helperSession[itemId] = it }
-        launchHelper(itemId, label, history, job, pin.session, provider, sub, model, brief = task)
+        launchHelper(itemId, label, history, job, pin.session, provider, sub, model, brief = task, chat = activeChat())
         return itemId
     }
 
     /** @param brief this job's brief (a pinned agent's history starts with an older one). */
     private fun launchHelper(itemId: Long, label: String, history: MutableList<Msg>, prompt: String, resume: String?, provider: LlmProvider?, sub: SubscriptionEngine?, model: String,
-                             brief: String = history.first().text) {
-        val ctx = ChatContext("helper-$itemId", interactive = true, helperItem = itemId, display = label)
+                             brief: String = history.first().text, chat: String? = null) {
+        val ctx = ChatContext("helper-$itemId", interactive = true, helperItem = itemId, display = label, chat = chat ?: activeChat())
         helperCtx[itemId] = ctx
         val j = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) { runHelper(itemId, label, history, prompt, resume, ctx, provider, sub, model, brief) }
         helpers[itemId] = HelperRun(itemId, label, brief, System.currentTimeMillis(), j)
@@ -1096,7 +1150,7 @@ class AgentRuntime(
             return if (out.contains("back on it")) "Stopped helper #$id and started it again with your message. Its result will arrive as a message." else out
         }
         steerInbox.getOrPut(id) { java.util.concurrent.ConcurrentLinkedQueue() } += message
-        db.chat().insert(ChatItem(kind = "activity", text = "Told it: ${message.take(140)}", meta = JSONObject().put("tool", "agent").put("by", label).put("helper", id).toString()))
+        db.chat().insert(ChatItem(kind = "activity", text = "Told it: ${message.take(140)}", chatId = runCatching { db.chat().get(id)?.chatId }.getOrNull() ?: activeChat(), meta = JSONObject().put("tool", "agent").put("by", label).put("helper", id).toString()))
         return "Helper #$id gets your message before its next step and keeps going."
     }
 
@@ -1115,8 +1169,8 @@ class AgentRuntime(
         val history = helperHistory[id] ?: pin?.let { pins.loadHistory(it.id).takeIf { h -> h.isNotEmpty() } } ?: mutableListOf(Msg.user(row.text))
         history += Msg.user(message)
         setHelperMeta(id) { it.put("state", "working").put("pushes", it.optInt("pushes") + 1).put("startedAt", System.currentTimeMillis()).remove("endedAt") }
-        db.chat().insert(ChatItem(kind = "activity", text = "Sent back: ${message.take(140)}", meta = JSONObject().put("tool", "agent").put("by", meta.optString("label")).put("helper", id).toString()))
-        launchHelper(id, meta.optString("label").ifBlank { "Helper" }, history, message, helperSession[id], provider, sub, meta.optString("model"), brief = row.text)
+        db.chat().insert(ChatItem(kind = "activity", text = "Sent back: ${message.take(140)}", chatId = row.chatId, meta = JSONObject().put("tool", "agent").put("by", meta.optString("label")).put("helper", id).toString()))
+        launchHelper(id, meta.optString("label").ifBlank { "Helper" }, history, message, helperSession[id], provider, sub, meta.optString("model"), brief = row.text, chat = row.chatId)
         return "Helper #$id is back on it. Its new result will arrive as a message."
     }
 
@@ -1125,7 +1179,7 @@ class AgentRuntime(
         val pm = context.getSystemService(android.os.PowerManager::class.java) ?: return
         if (pm.isIgnoringBatteryOptimizations(context.packageName) || settings.extra("battery_hint") != null) return
         settings.setExtra("battery_hint", "1")
-        db.chat().insert(ChatItem(kind = "notice", text = "Tip: helpers keep working with the app closed, but some phones (Samsung especially) stop background apps to save battery. Open Settings and tap \"Battery: unrestricted\" so they aren't cut off."))
+        sayIn(activeChat(), "notice", "Tip: helpers keep working with the app closed, but some phones (Samsung especially) stop background apps to save battery. Open Settings and tap \"Battery: unrestricted\" so they aren't cut off.")
     }
 
     /** One writer at a time: the step counter, the gate and the finish all edit the same row, and a read-modify-write that overlaps loses an edit. */
@@ -1188,7 +1242,7 @@ class AgentRuntime(
             is EscalationGate.Triage.Forward -> "$name passed it to you: ${message.take(140)}"
             is EscalationGate.Triage.Answer -> "$name answered: ${message.take(140)}"
             else -> "$name sent it back: ${message.take(140)}"
-        }, meta = JSONObject().put("tool", "agent").put("by", e.label).put("helper", e.helperId).toString()))
+        }, chatId = runCatching { db.chat().get(e.helperId)?.chatId }.getOrNull() ?: activeChat(), meta = JSONObject().put("tool", "agent").put("by", e.label).put("helper", e.helperId).toString()))
         return when (t) {
             is EscalationGate.Triage.Forward -> "Forwarded to the user with your reason. The helper carries on once they answer."
             is EscalationGate.Triage.Answer -> "Helper #${e.helperId} has your answer and carries on."
@@ -1300,8 +1354,9 @@ class AgentRuntime(
                 com.past9.phoneaos.browser.BrowserService.release("helper-$itemId")
                 phone.workFinished()
                 // The main agent hears back unless the user stopped it (then there is nothing to report).
+                val originChat = runCatching { db.chat().get(itemId)?.chatId }.getOrNull()
                 if (state == "stopped") helperBatch.remove(itemId)?.let { b -> if (helperBatch.values.none { it == b }) batchResults.remove(b)?.takeIf { it.isNotEmpty() }?.let { all ->
-                    deliverFor(branchId, "[Helpers finished: the rest of the group was stopped. Give the user ONE packed answer from these.]\n\n" + all.joinToString("\n\n") { it.second }, null) } }
+                    deliverFor(branchId, "[Helpers finished: the rest of the group was stopped. Give the user ONE packed answer from these.]\n\n" + all.joinToString("\n\n") { it.second }, null, originChat) } }
                 if (state != "stopped") {
                     val chore = handsBack.containsMatchIn(result.take(3_000))
                     val nudge = if (chore && state == "done" && pushes < 2)
@@ -1315,12 +1370,12 @@ class AgentRuntime(
                     val note = "[Helper #$itemId \"$label\" ${if (state == "done") "finished" else "failed"}${if (pushes > 0) " (after $pushes push${if (pushes > 1) "es" else ""})" else ""}]\n${result.take(12_000).ifBlank { "(no result text)" }}$nudge$keep"
                     val origin = runCatching { JSONObject(db.chat().get(itemId)?.meta ?: "{}").optLong("origin").takeIf { it > 0 } }.getOrNull()
                     val batch = helperBatch.remove(itemId)
-                    if (batch == null) deliverFor(branchId, note, origin)
+                    if (batch == null) deliverFor(branchId, note, origin, originChat)
                     else {
                         // Part of one answer: hold it until every helper in the group is done, then hand them over together.
                         batchResults.getOrPut(batch) { java.util.concurrent.ConcurrentLinkedQueue() }.add(itemId to note)
                         if (helperBatch.values.none { it == batch }) batchResults.remove(batch)?.let { all ->
-                            deliverFor(branchId, "[Helpers finished: all ${all.size} you started together are done. Give the user ONE packed answer.]\n\n" + all.joinToString("\n\n") { it.second }, origin)
+                            deliverFor(branchId, "[Helpers finished: all ${all.size} you started together are done. Give the user ONE packed answer.]\n\n" + all.joinToString("\n\n") { it.second }, origin, originChat)
                         }
                     }
                 }
@@ -1341,7 +1396,7 @@ class AgentRuntime(
                     val name = e.optString("name")
                     setHelperMeta(itemId) { it.put("now", labelFor(name)) }
                     if (workerToolNames.none { it == name }) db.chat().insert(ChatItem(kind = "activity", text = describeExternalTool(name, e.optString("detail")),
-                        meta = JSONObject().put("tool", toolGroup(name)).put("by", helpers[itemId]?.label ?: "helper").put("helper", itemId).toString()))
+                        chatId = runCatching { db.chat().get(itemId)?.chatId }.getOrNull() ?: activeChat(), meta = JSONObject().put("tool", toolGroup(name)).put("by", helpers[itemId]?.label ?: "helper").put("helper", itemId).toString()))
                 }
                 "done" -> ok = e.optBoolean("ok", true)
                 "error" -> error = e.optString("message").takeIf { it.isNotBlank() && !it.matches(Regex("exit \\d+")) }
@@ -1381,23 +1436,23 @@ class AgentRuntime(
             val msg = if (settings.state.value.mode == PowerMode.SUBSCRIPTION)
                 "Your ${settings.state.value.subKind.label} subscription isn't signed in or ready on this phone, so \"$name\" couldn't run. Open Settings to sign in again."
             else "No AI is set up (no API key and no subscription), so \"$name\" couldn't run. Open Settings to set one up."
-            db.chat().insert(ChatItem(kind = "notice", text = msg))
+            sayIn("main", "notice", msg)
             phone.notify("\"$name\" didn't run", msg)
             return msg
         }
-        val ctx = ChatContext("routine", interactive = false)
+        val ctx = ChatContext("routine", interactive = false, chat = "main")
         phone.workStarted()
         return try {
             // A routine is work, not conversation: it runs with the helpers' tools.
             val sys = systemPrompt(prompt, role = PromptRole.ROUTINE)
             val out = if (sub != null) runRoutineOnSubscription(sub, "Routine \"$name\": $prompt", sys, ctx)
                 else AgentLoop(provider!!, settings.state.value.model, tools(forHelper = true)).run(sys, mutableListOf(Msg.user("Routine \"$name\": $prompt")), ctx)
-            db.chat().insert(ChatItem(kind = "agent", text = out, meta = JSONObject().put("routine", name).toString()))
+            sayIn("main", "agent", out, JSONObject().put("routine", name))
             phone.notify(name, out.lineSequence().firstOrNull { it.isNotBlank() }?.take(180) ?: "Done")
             out
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
             val msg = friendlyError(e)
-            db.chat().insert(ChatItem(kind = "notice", text = "Routine \"$name\" failed: $msg"))
+            sayIn("main", "notice", "Routine \"$name\" failed: $msg")
             msg
         } finally { phone.workFinished() }
     }
@@ -1445,9 +1500,60 @@ class AgentRuntime(
         return last.ifBlank { null }
     }
 
+    // ---- multi-chat ---------------------------------------------------------------------------
+
+    /** All threads, pinned first then newest-first (Muse's sortedForView). Archived trail at the end. */
+    fun chats(): kotlinx.coroutines.flow.Flow<List<com.past9.phoneaos.data.ChatThread>> = db.chats().all()
+
+    /** Start a fresh chat and switch to it. Returns its id. */
+    suspend fun newChat(title: String = "New chat"): String {
+        val id = "c" + java.util.UUID.randomUUID().toString().take(8)
+        db.chats().insert(com.past9.phoneaos.data.ChatThread(id = id, title = title))
+        settings.setActiveChat(id)
+        return id
+    }
+
+    /** Switch the visible chat. No-op when unknown. */
+    suspend fun switchChat(id: String): Boolean {
+        val row = db.chats().get(id) ?: return false
+        settings.setActiveChat(row.id)
+        return true
+    }
+
+    suspend fun renameChat(id: String, title: String): Boolean {
+        val row = db.chats().get(id) ?: return false
+        db.chats().update(row.copy(title = title.trim().take(80).ifBlank { row.title }, updatedAt = System.currentTimeMillis()))
+        return true
+    }
+
+    suspend fun pinChat(id: String, pinned: Boolean): Boolean {
+        val row = db.chats().get(id) ?: return false
+        db.chats().update(row.copy(pinned = pinned, updatedAt = System.currentTimeMillis()))
+        return true
+    }
+
+    suspend fun archiveChat(id: String, archived: Boolean): Boolean {
+        if (id == "main") return false
+        val row = db.chats().get(id) ?: return false
+        db.chats().update(row.copy(archived = archived, updatedAt = System.currentTimeMillis()))
+        if (archived && settings.activeChat() == id) settings.setActiveChat("main")
+        return true
+    }
+
+    /** Delete a chat and everything in it (Muse's DeleteSession). "main" is never deletable. */
+    suspend fun deleteChat(id: String): Boolean {
+        if (id == "main") return false
+        if (db.chats().get(id) == null) return false
+        stop()
+        db.chat().clearChat(id); db.chat().clearChatTurns(id); db.chats().delete(id)
+        settings.setChatSession(id, null)
+        if (settings.activeChat() == id) settings.setActiveChat("main")
+        return true
+    }
+
     /** Overnight: the model's transcript is folded into the running story, so each day starts clean. The chat the user sees stays. */
     suspend fun compact() = turnLock.withLock {
-        db.chat().clearTurns("main"); settings.setExtra("claude_session", null)
+        db.chat().clearTurns(activeChat()); settings.setChatSession(activeChat(), null)
     }
 
     private inner class QuietContext : ToolContext {
@@ -1458,8 +1564,11 @@ class AgentRuntime(
         override suspend fun notify(title: String, body: String) {}
     }
 
+    /** Clear the chat the user is looking at (the settings "clear chat" action). Only "main" resets global state. */
     fun clearConversation() = scope.launch {
-        db.chat().clear(); db.chat().clearTurns("main"); db.chat().clearBranchTurns(); settings.setExtra("claude_session", null); settings.setExtra("conversation_id", null); settings.setExtra("branch_pending", null); unmerged.set(0)
+        val chat = activeChat()
+        db.chat().clearChat(chat); db.chat().clearChatTurns(chat); settings.setChatSession(chat, null)
+        if (chat == "main") { db.chat().clearBranchTurns(); settings.setExtra("claude_session", null); settings.setExtra("conversation_id", null); settings.setExtra("branch_pending", null); unmerged.set(0) }
     }
 
     // ---- tool context -----------------------------------------------------------------------
@@ -1468,9 +1577,12 @@ class AgentRuntime(
                                     /** The branch this agent is, when it is one: its steps and questions are tagged so they fold into that branch. */
                                     private val branchItem: Long? = null,
                                     /** What the user sees as this agent's name ("Uber to airport"). */
-                                    private val display: String = agentLabel) : ToolContext {
+                                    private val display: String = agentLabel,
+                                    /** The chat thread this agent works in (main line, branch, or helper's origin chat). */
+                                    private val chat: String? = null) : ToolContext {
+        private fun chatOf(): String = chat ?: activeChat()
         override suspend fun activity(text: String, meta: JSONObject): Long =
-            db.chat().insert(ChatItem(kind = "activity", text = text, meta = meta.put("by", display).apply { helperItem?.let { put("helper", it) }; branchItem?.let { put("branch", it) } }.toString()))
+            db.chat().insert(ChatItem(kind = "activity", text = text, chatId = chatOf(), meta = meta.put("by", display).apply { helperItem?.let { put("helper", it) }; branchItem?.let { put("branch", it) } }.toString()))
         override suspend fun updateActivity(id: Long, text: String, meta: JSONObject) {
             db.chat().get(id)?.let { old -> db.chat().update(old.copy(text = text, meta = JSONObject(old.meta).also { m -> meta.keys().forEach { k -> m.put(k, meta.get(k)) } }.toString())) }
         }
@@ -1483,7 +1595,7 @@ class AgentRuntime(
 
         /** Put the question to the user (a card and a notification) and wait. @param why the main agent's reason, on a forwarded request. */
         suspend fun askUser(question: String, options: List<String>, why: String?): String? {
-            val id = db.chat().insert(ChatItem(kind = "question", text = question, meta = JSONObject().put("options", org.json.JSONArray(options))
+            val id = db.chat().insert(ChatItem(kind = "question", text = question, chatId = chatOf(), meta = JSONObject().put("options", org.json.JSONArray(options))
                 .apply { helperItem?.let { put("helper", it).put("by", display) }; why?.let { put("why", it).put("whyBy", agentName()) }; branchItem?.let { put("branch", it) } }.toString()))
             val d = CompletableDeferred<String>(); pending[id] = d
             if (helperItem == null) mainQuestions += id
@@ -1563,7 +1675,7 @@ class AgentRuntime(
         settings.setExtra("selfcheck_ok", null); settings.setExtra("selfcheck_fail", msg)
         com.past9.phoneaos.agent.Crashes.record(context, "self-check failed: $msg", null)
         if (before != msg) {
-            db.chat().insert(ChatItem(kind = "notice", text = SelfCheck.notice(result)))
+            sayIn("main", "notice", SelfCheck.notice(result))
             phone.notify("Tools don't work with $power", detail.take(160))
         }
         return result
