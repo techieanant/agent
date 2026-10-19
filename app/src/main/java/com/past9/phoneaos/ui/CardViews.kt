@@ -4,6 +4,8 @@ import android.webkit.WebView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -98,6 +100,8 @@ data class CardSheetActions(
     val onRefresh: (Card) -> Unit = {},
     val onPin: (Card, Boolean) -> Unit = { _, _ -> },
     val onAsk: (Card, String) -> Unit = { _, _ -> },
+    /** A tap on a button in an OpenUI card: to the agent in the background. Null: asked like onAsk. */
+    val onAct: ((Card, String) -> Unit)? = null,
     val onOpenLink: (String) -> Unit = {},
     /** A search box in the card: run its script with this input, return {ok, data or error}. */
     val onRun: suspend (Card, String) -> Pair<Boolean, String> = { _, _ -> false to "{}" },
@@ -137,7 +141,16 @@ fun CardSheet(c: Card, dark: Boolean, accent: String, actions: CardSheetActions,
                 Text("The last refresh didn't work, so this may be out of date. Ask your agent to fix it.", Modifier.padding(12.dp),
                     style = MaterialTheme.typography.bodySmall, color = cs.onErrorContainer)
             }
-            if (LocalSheetPreview.current) {
+            if (c.isOpenUi) {
+                // New cards: drawn natively in the live accent and theme. A tap on a button asks the agent, a link opens the browser.
+                val src = remember(c.openui, c.data) { c.openUiSource() }
+                CompositionLocalProvider(com.past9.phoneaos.ui.openui.LocalOpenUiSend provides { text -> actions.onAsk(c, text) },
+                    com.past9.phoneaos.ui.openui.LocalOpenUiAct provides actions.onAct?.let { act -> { text: String -> act(c, text) } }) {
+                    Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp).navigationBarsPadding()) {
+                        com.past9.phoneaos.ui.openui.OpenUiBlock(src)
+                    }
+                }
+            } else if (LocalSheetPreview.current) {
                 // Screenshot tests can't run a WebView: show where it sits.
                 Box(Modifier.fillMaxWidth().weight(1f).padding(20.dp).clip(MaterialTheme.shapes.large).background(cs.surfaceContainer))
             } else {

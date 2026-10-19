@@ -97,7 +97,9 @@ fun HomeScreen(s: HomeState, actions: HomeActions, bottomPadding: Dp = 120.dp) {
     val blockedMine = s.tasks.filter { it.status == "blocked" && it.blocker.isNotBlank() && it.owner == "agent" }
     val openGoals = s.goals.filter { it.status == "open" }
     val lastAgent = s.items.lastOrNull { it.kind == "agent" }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = bottomPadding), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    // What the agent is doing and what needs you; then your list, goals and what's coming.
+    // A phone shows them in one column; a landscape tablet side by side.
+    val primary: androidx.compose.foundation.lazy.LazyListScope.() -> Unit = {
         item {
             Row(Modifier.fillMaxWidth().statusBarsPadding().padding(top = 8.dp, start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -166,6 +168,8 @@ fun HomeScreen(s: HomeState, actions: HomeActions, bottomPadding: Dp = 120.dp) {
             item { SectionHeader("Your cards", "Kept up to date for you. Tap one to open it", Modifier.padding(start = 4.dp, top = 6.dp)) }
             item { com.past9.phoneaos.ui.CardTiles(s.cards, actions.onCard, s.now) }
         }
+    }
+    val secondary: androidx.compose.foundation.lazy.LazyListScope.() -> Unit = {
         item { SectionHeader("Your to-dos", if (myTodos.isEmpty()) "Nothing on your list" else "${myTodos.size} open, soonest first", Modifier.padding(start = 4.dp, top = 6.dp)) {
             TextButton(onClick = actions.onTasks) { Text("All") }
         } }
@@ -220,7 +224,7 @@ fun HomeScreen(s: HomeState, actions: HomeActions, bottomPadding: Dp = 120.dp) {
                             Spacer(Modifier.height(4.dp))
                             // The real message, rendered (bold, lists, links), cut to a few lines; no raw markdown.
                             Box(Modifier.heightIn(max = 112.dp)) {
-                                com.past9.phoneaos.ui.Markdown(com.past9.phoneaos.voice.Tts.stripEmoji(latest.text).replace(Regex("!\\[[^]]*]\\([^)]*\\)"), "").lines().filter { it.isNotBlank() }.take(4).joinToString("\n"),
+                                com.past9.phoneaos.ui.Markdown(com.past9.phoneaos.voice.Tts.stripEmoji(com.past9.phoneaos.ui.openui.OpenUiLang.plainText(latest.text)).replace(Regex("!\\[[^]]*]\\([^)]*\\)"), "").lines().filter { it.isNotBlank() }.take(4).joinToString("\n"),
                                     style = MaterialTheme.typography.bodyMedium)
                             }
                             Spacer(Modifier.height(8.dp))
@@ -230,6 +234,13 @@ fun HomeScreen(s: HomeState, actions: HomeActions, bottomPadding: Dp = 120.dp) {
                 }
             }
         }
+    }
+    if (com.past9.phoneaos.ui.widthClass() != com.past9.phoneaos.ui.WidthClass.EXPANDED) {
+        val side = com.past9.phoneaos.ui.sidePad(16.dp)
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = side, end = side, bottom = bottomPadding), verticalArrangement = Arrangement.spacedBy(14.dp)) { primary(); secondary() }
+    } else Row(Modifier.fillMaxSize().padding(horizontal = com.past9.phoneaos.ui.sidePad(24.dp, com.past9.phoneaos.ui.Readable.WIDE)), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+        LazyColumn(Modifier.weight(1f).fillMaxHeight(), contentPadding = PaddingValues(bottom = bottomPadding), verticalArrangement = Arrangement.spacedBy(14.dp)) { primary() }
+        LazyColumn(Modifier.weight(1f).fillMaxHeight().statusBarsPadding(), contentPadding = PaddingValues(top = 8.dp, bottom = bottomPadding), verticalArrangement = Arrangement.spacedBy(14.dp)) { secondary() }
     }
 }
 
@@ -265,19 +276,19 @@ private fun NeedsYouCard(q: ChatItem, actions: HomeActions) {
         }
         return
     }
+    if (!approval) {
+        val meta = JSONObject(q.meta)
+        val why = meta.optString("why").takeIf { it.isNotBlank() }?.let { "${meta.optString("whyBy").ifBlank { "Your agent" }}: $it" }
+        com.past9.phoneaos.ui.openui.AskCard("Needs you", why, q.text, opts, onPick = { o -> actions.onAnswer(q.id, o) })
+        return
+    }
     Surface(shape = MaterialTheme.shapes.extraLarge, color = cs.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp)) {
-            Text(if (approval) "APPROVE?" else "QUESTION", style = Eyebrow, color = cs.onTertiaryContainer)
+            Text("APPROVE?", style = Eyebrow, color = cs.onTertiaryContainer)
             Spacer(Modifier.height(4.dp))
-            Text(if (approval) parts.getOrElse(1) { "" } else q.text, style = MaterialTheme.typography.titleMedium, color = cs.onTertiaryContainer, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            Text(parts.getOrElse(1) { "" }, style = MaterialTheme.typography.titleMedium, color = cs.onTertiaryContainer, maxLines = 3, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(12.dp))
-            if (approval) Button(onClick = actions.onChat, modifier = Modifier.fillMaxWidth().height(48.dp), shapes = ButtonDefaults.shapes()) { Text("Review and approve") }
-            else FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                opts.forEachIndexed { i, o ->
-                    if (i == 0) Button(onClick = { actions.onAnswer(q.id, o) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.heightIn(min = 44.dp)) { Text(o) }
-                    else OutlinedButton(onClick = { actions.onAnswer(q.id, o) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.heightIn(min = 44.dp)) { Text(o, color = cs.onTertiaryContainer) }
-                }
-            }
+            Button(onClick = actions.onChat, modifier = Modifier.fillMaxWidth().height(48.dp), shapes = ButtonDefaults.shapes()) { Text("Review and approve") }
         }
     }
 }

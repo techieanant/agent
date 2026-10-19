@@ -1,6 +1,7 @@
 package com.past9.phoneaos.tools
 
 import android.content.Context
+import com.past9.phoneaos.agent.AskOptions
 import com.past9.phoneaos.agent.Tool
 import com.past9.phoneaos.agent.ToolContext
 import com.past9.phoneaos.agent.ToolSpec
@@ -10,6 +11,10 @@ import com.past9.phoneaos.agent.schema
 import com.past9.phoneaos.agent.str
 import com.past9.phoneaos.browser.BrowserEngine
 import com.past9.phoneaos.browser.BrowserService
+import com.past9.phoneaos.browser.SiteAdapt
+import com.past9.phoneaos.browser.SiteCatalog
+import com.past9.phoneaos.browser.SiteHealth
+import com.past9.phoneaos.App
 import org.json.JSONObject
 
 /** The browser tools share one engine; they start the background service on first use. */
@@ -26,15 +31,56 @@ abstract class BrowserTool(protected val context: Context) : Tool {
 }
 
 class BrowserOpenTool(c: Context) : BrowserTool(c) {
-    override val spec = ToolSpec("browser_open", "Open a URL in your own background browser (a real phone browser that keeps working while the user is in other apps). Returns the page outline with numbered elements. Pick a profile (the user's browser accounts, e.g. Personal or Work) when it matters which account is signed in.",
-        schema(listOf("url"), "url" to str("URL or domain"), "profile" to str("Browser profile name; default is the first one")))
+    override val spec = ToolSpec("browser_open", "Open a URL in your own background browser (a real phone browser that keeps working while the user is in other apps). Returns the page outline with numbered elements. It works out by itself how the site wants to be opened: if the site turns the browser away it retries as the other kind of browser (phone or desktop), remembers what worked for that site, and tells you what it saw. If it still can't get in, you get a diagnosis with the next steps. Pick a profile (the user's browser accounts, e.g. Personal or Work) when it matters which account is signed in.",
+        schema(listOf("url"), "url" to str("URL or domain"), "profile" to str("Browser profile name; default is the first one"),
+            "desktop" to bool("Force a desktop (true) or phone (false) browser for this site. Leave it out and the app decides from what it has learned about the site; it stays on for later pages until you pass false.")))
     override suspend fun run(input: JSONObject, ctx: ToolContext): String {
         val url = input.optString("url")
         input.optString("profile").takeIf { it.isNotBlank() }?.let { want -> profiles().firstOrNull { it.equals(want, true) }?.let { lastProfile[ctx.agentLabel] = it } }
         val id = ctx.activity("Browsing $url", JSONObject().put("tool", "browser"))
-        val e = engine(ctx); val p = e.goto(url)
-        ctx.updateActivity(id, "Opened ${p.title.ifBlank { p.url }}", JSONObject().put("tool", "browser").put("url", p.url))
-        return e.snapshot()
+        val e = engine(ctx)
+        val opened = SiteAdapt.open(e.port, SiteCatalog(App.graph(context).settings), url, if (input.has("desktop")) input.optBoolean("desktop") else null)
+        val p = e.page.value
+        ctx.updateActivity(id, (if (opened.verdict.ok) "Opened " else "Refused: ") + p.title.ifBlank { p.url }, JSONObject().put("tool", "browser").put("url", p.url))
+        return opened.notes + e.snapshot()
+    }
+}
+
+/** Find out how a site behaves in this browser before anyone builds on it, and remember it. */
+class SiteProbeTool(c: Context) : BrowserTool(c) {
+    override val spec = ToolSpec("site_probe", "Find out how a site behaves in this browser before you build anything on it, or when it misbehaves. Loads it as a phone browser and as a desktop browser, reads each result for signs of a refusal (HTTP block, 'unsupported browser', captcha wall, empty page, refused sign-in), remembers which way works, and reports both. The result is kept in the site catalog, so browser_open starts the right way from then on. Does not sign in or change anything on the site.",
+        schema(listOf("url"), "url" to str("URL or domain")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val url = input.optString("url").trim().ifEmpty { return "No URL." }
+        val id = ctx.activity("Checking how $url behaves", JSONObject().put("tool", "browser"))
+        val e = engine(ctx); val catalog = SiteCatalog(App.graph(context).settings)
+        val before = e.desktop
+        val results = listOf(false, true).map { desktop ->
+            e.setDesktop(desktop)
+            val l = e.port.load(url); desktop to SiteHealth.assess(l.status, l.error, l.title, l.text)
+        }
+        val best = results.firstOrNull { it.second.ok }
+        e.setDesktop(best?.first ?: before)
+        if (best != null) catalog.record(url, best.first, "works", results.firstOrNull { !it.second.ok }?.let { "as a ${if (it.first) "desktop" else "phone"} browser: ${it.second.refusal.label}" }.orEmpty())
+        else catalog.record(url, before, "refused", results.first().second.refusal.label)
+        ctx.updateActivity(id, if (best != null) "$url works as a ${if (best.first) "desktop" else "phone"} browser" else "$url refuses this browser", JSONObject().put("tool", "browser"))
+        return buildString {
+            results.forEach { (d, v) -> appendLine("As a ${if (d) "desktop" else "phone"} browser: ${v.refusal.label}${if (v.evidence.isNotBlank()) " (\"${v.evidence}\")" else ""}") }
+            if (best != null) append("Result: use a ${if (best.first) "desktop" else "phone"} browser for this site. Remembered; browser_open will do it by itself. The browser is on the page now.")
+            else append(SiteAdapt.diagnosis(results.first().second, listOf("phone", "desktop"), url))
+        }
+    }
+}
+
+/** What the app has learned about how sites behave in its browser, so an agent is told instead of finding out the hard way. */
+class SiteCatalogTool(c: Context) : BrowserTool(c) {
+    override val spec = ToolSpec("site_catalog", "What the app has already learned about how sites behave in its browser (which sites need a desktop browser, which refused it and why). Give a url for one site, or nothing for everything known. It fills in by itself as the browser opens sites.",
+        schema(emptyList(), "url" to str("Optional: one site")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val catalog = SiteCatalog(App.graph(context).settings)
+        val url = input.optString("url").trim()
+        if (url.isNotEmpty()) return catalog.get(url)?.line() ?: "Nothing learned about ${SiteCatalog.siteOf(url) ?: url} yet. site_probe it, or just browser_open it and it will be learned."
+        return catalog.list().joinToString("\n") { it.line() }.ifBlank { "Nothing learned yet. It fills in as sites are opened." }
     }
 }
 
@@ -115,7 +161,7 @@ class BrowserHandoffTool(c: Context) : BrowserTool(c) {
         engine(ctx)
         // No notification of its own: a helper's handoff reaches the user only if the main agent forwards it (and that notifies).
         val a = ctx.ask("${input.optString("reason")} Open the browser, do it, then tap Done.", listOf("Open browser", "Done", "Skip"))
-        return when (a) { null -> "No one is around to help right now."; "Skip" -> "The user skipped it."; else -> "The user says they are done. Read the page to check." }
+        return when (a) { null -> "No one is around to help right now."; "Skip" -> "The user skipped it."; AskOptions.NO -> AskOptions.TURNED_DOWN; else -> "The user says they are done. Read the page to check." }
     }
 }
 
@@ -138,4 +184,55 @@ class BrowserUploadTool(c: Context) : BrowserTool(c) {
     }
 }
 
-fun browserTools(c: Context): List<Tool> = listOf(BrowserUploadTool(c), BrowserOpenTool(c), BrowserReadTool(c), BrowserClickTool(c), BrowserTypeTool(c), BrowserKeyTool(c), BrowserWaitTool(c), BrowserScrollTool(c), BrowserBackTool(c), BrowserScreenshotTool(c), BrowserLookTool(c), BrowserHandoffTool(c))
+fun browserTools(c: Context): List<Tool> = listOf(BrowserUploadTool(c), BrowserOpenTool(c), SiteProbeTool(c), SiteCatalogTool(c), BrowserReadTool(c), BrowserClickTool(c), BrowserTypeTool(c), BrowserKeyTool(c), BrowserWaitTool(c), BrowserScrollTool(c), BrowserBackTool(c), BrowserScreenshotTool(c), BrowserLookTool(c), BrowserHandoffTool(c), BrowserEvalTool(c), BrowserNetworkTool(c), BrowserConsoleTool(c))
+
+
+/** Run JavaScript in the page the agent is looking at: read its structure and storage, call the site's own endpoints, test a tool body. */
+class BrowserEvalTool(c: Context) : BrowserTool(c) {
+    override val spec = ToolSpec("browser_eval", "Run JavaScript in the current page and get back what you return. The body of an async function: it sees `args`, may use await and fetch(url, {credentials:'include'}) (the page's signed-in session), and returns a JSON-able value. Use it to read the page (document.querySelector, outerHTML slices, aria-labels), list localStorage keys or cookie NAMES, call the site's own JSON endpoints, and to test tool code before webapp_save. It runs as the signed-in user: reading is fine, but anything that sends, posts or deletes needs request_approval first. Never return tokens or cookie values.",
+        schema(listOf("js"), "js" to str("Async function body, e.g. const r = await fetch('/api/me', {credentials:'include'}); return await r.json();"), "args" to str("Optional JSON object the body sees as `args`")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val args = runCatching { JSONObject(input.optString("args").ifBlank { "{}" }) }.getOrElse { return "args must be a JSON object." }
+        val e = engine(ctx)
+        val out = com.past9.phoneaos.connections.WebApps.result(e.runAsync(input.optString("js"), args))
+        ctx.activity("Ran a script on ${e.page.value.url.substringAfter("//").substringBefore('/')}", JSONObject().put("tool", "browser"))
+        return out
+    }
+}
+
+/** Chrome's Network tab for the agent: what the site sends while it does something. */
+class BrowserNetworkTool(c: Context) : BrowserTool(c) {
+    override val spec = ToolSpec("browser_network", "See what the site sends. action 'start' begins recording (a page reload clears the page-side part), then you do the thing in the page (click, type, scroll, open a chat), then 'log' shows it: the page's own fetch / XHR calls with method, URL, status and a slice of the request and reply, WebSocket opens, and the browser's own requests with header names (login values hidden). filter narrows by a word in the URL. 'stop' ends it, 'clear' empties it. Look for JSON endpoints: they are the best thing to build tools on.",
+        schema(listOf("action"), "action" to enumOf("What to do", "start", "log", "stop", "clear"), "filter" to str("Only calls whose method or URL contain this word"), "limit" to com.past9.phoneaos.agent.int("How many of the newest calls to show, default 40")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val e = engine(ctx)
+        val P = com.past9.phoneaos.connections.PageJs
+        return when (input.optString("action")) {
+            "start" -> { e.netControl(true); "Recording. Now do the action in the page, then call browser_network with action log." }
+            "stop" -> { e.netControl(false); "Stopped." }
+            "clear" -> { e.nativeLog.clear(); e.js(P.netClear()); "Cleared." }
+            else -> {
+                val filter = input.optString("filter").trim().lowercase(); val limit = input.optInt("limit", 40).coerceIn(1, 100)
+                val page = runCatching { org.json.JSONArray(e.js(P.netLog(filter, limit))) }.getOrDefault(org.json.JSONArray())
+                val native = e.nativeLog.toList().filter { filter.isEmpty() || (it.method + " " + it.url).lowercase().contains(filter) }.takeLast(limit)
+                if (page.length() == 0 && native.isEmpty()) return "Nothing recorded${if (filter.isNotEmpty()) " for \"$filter\"" else ""}. Did you start recording first (action start), and then do something in the page?"
+                buildString {
+                    appendLine("PAGE CALLS (fetch / XHR / WebSocket, with a slice of what was sent and received):")
+                    for (i in 0 until page.length()) page.getJSONObject(i).let { o -> appendLine("${o.optString("m")} ${o.optString("u")} -> ${if (o.has("s")) o.optInt("s") else "?"}" + o.optString("rq").takeIf { it.isNotBlank() }?.let { "\n    sent: ${it.replace('\n', ' ')}" }.orEmpty() + o.optString("rs").takeIf { it.isNotBlank() }?.let { "\n    got: ${it.replace('\n', ' ')}" }.orEmpty()) }
+                    if (page.length() == 0) appendLine("(none: the site may use a worker, or you reloaded after start; start again and repeat the action)")
+                    appendLine("\nBROWSER REQUESTS (everything the browser sent, scripts and workers included, header names only):")
+                    native.forEach { appendLine("${it.method} ${it.url}\n    ${it.headers}") }
+                }.take(24_000)
+            }
+        }
+    }
+}
+
+class BrowserConsoleTool(c: Context) : BrowserTool(c) {
+    override val spec = ToolSpec("browser_console", "The page's console messages (errors and logs), newest last. Useful when something on a site doesn't work or you are testing a script.", schema(emptyList(), "clear" to bool("Empty the log after reading")))
+    override suspend fun run(input: JSONObject, ctx: ToolContext): String {
+        val e = engine(ctx); val lines = e.consoleLog.toList().takeLast(60)
+        if (input.optBoolean("clear")) e.consoleLog.clear()
+        return if (lines.isEmpty()) "The console is empty." else lines.joinToString("\n")
+    }
+}

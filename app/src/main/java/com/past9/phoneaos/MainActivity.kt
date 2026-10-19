@@ -68,6 +68,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Results of jobs handed to the user's machines: caught up and awaited only while the app is on screen.
+        com.past9.phoneaos.handoff.Handoffs.onScreen(this)
+    }
+
     override fun onResume() {
         super.onResume()
         com.past9.phoneaos.triggers.Overnight.onAppOpen(this)
@@ -81,6 +87,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        com.past9.phoneaos.handoff.Handoffs.offScreen()
         // Swap the home-screen icon to the user's character only once they've left the app.
         val st = App.graph(this).settings.state.value
         if (st.onboarded) runCatching { com.past9.phoneaos.system.Identity.applyLauncherIcon(this, st.mascot, st.accent) }
@@ -95,6 +102,25 @@ class MainActivity : ComponentActivity() {
         i.getStringExtra("url")?.takeIf { i.getStringExtra("open") == "browser" }?.let { u ->
             App.graph(this).scope.launch { runCatching { BrowserService.await(this@MainActivity, "main", App.graph(this@MainActivity).settings.state.value.browserProfiles.first()).goto(u) } }
         }
+        // adb hook for checking how a site behaves in the browser (what it does by itself when a site refuses it):
+        //   am start -n <pkg>/.MainActivity --es open probe --es url https://...   then read: logcat -s SiteProbe
+        // It opens the site twice in its own throwaway browser (the second visit shows what was learned), logs both, and forgets the site again.
+        i.getStringExtra("url")?.takeIf { i.getStringExtra("open") == "probe" }?.let { u ->
+            val g = App.graph(this)
+            g.scope.launch {
+                runCatching {
+                    val e = BrowserService.await(this@MainActivity, "probe", g.settings.state.value.browserProfiles.first())
+                    val c = com.past9.phoneaos.browser.SiteCatalog(g.settings)
+                    c.forget(u)
+                    for (visit in 1..2) {
+                        val o = com.past9.phoneaos.browser.SiteAdapt.open(e.port, c, u, null)
+                        android.util.Log.i("SiteProbe", "visit $visit $u -> ok=${o.verdict.ok} refusal=${o.verdict.refusal} desktop=${o.desktop} triedBoth=${o.triedBoth} status=${e.lastStatus} final=${e.page.value.url.take(60)} title=${e.page.value.title.take(40)} evidence=${o.verdict.evidence.take(80)} | textNow=[${e.visibleText().let { t -> "${t.length}:" + t.replace(Regex("\\s+"), " ").take(110) }}] navSeq=${e.navSeq} | catalog=${c.get(u)?.line()} | notes=${o.notes.lines().firstOrNull().orEmpty().take(160)}")
+                    }
+                    c.forget(u)
+                }.onFailure { android.util.Log.e("SiteProbe", "failed", it) }
+            }
+            return
+        }
         if (i.getStringExtra("open") == "testnotify") {
             App.graph(this).phone.notify("Checking in", "This is how my messages look on your phone.")
             moveTaskToBack(true); return
@@ -108,14 +134,22 @@ class MainActivity : ComponentActivity() {
         val settings by g.settings.state.collectAsStateWithLifecycle()
         if (!settings.onboarded) { Onboarding(g); return }
 
+        // Once: if the phone would hold back reminders (battery optimisation, a sleeping Samsung app), say so with the fix.
+        var offerReliability by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) {
+            if (g.settings.extra("reliability_offered") == null && com.past9.phoneaos.system.Background.problems(com.past9.phoneaos.system.Background.check(this@MainActivity)).isNotEmpty()) {
+                g.settings.setExtra("reliability_offered", "1"); offerReliability = true
+            }
+        }
+        if (offerReliability) com.past9.phoneaos.ui.screens.ReliabilitySheet { offerReliability = false }
         val items by g.db.chat().all().collectAsStateWithLifecycle(emptyList())
         val status by g.runtime.status.collectAsStateWithLifecycle()
         val goals by g.db.tasks().goals().collectAsStateWithLifecycle(emptyList())
         val tasks by g.db.tasks().tasks().collectAsStateWithLifecycle(emptyList())
         val memories by g.db.memory().all().collectAsStateWithLifecycle(emptyList())
         val allRoutines by g.db.triggers().all().collectAsStateWithLifecycle(emptyList())
-        // A card's refresh schedule is part of the card, not a routine of its own.
-        val routines = allRoutines.filter { it.kind != com.past9.phoneaos.cards.CardScripts.KIND }
+        // A card's refresh schedule is part of the card, and a wake is a one-off follow-up (see wake_list), not a routine of its own.
+        val routines = allRoutines.filter { it.kind != com.past9.phoneaos.cards.CardScripts.KIND && it.kind != com.past9.phoneaos.triggers.Wakes.KIND }
         val browserLive by BrowserService.running.collectAsStateWithLifecycle()
         val nav = rememberNavController()
         val notifRows by g.db.notifications().recent(200).collectAsStateWithLifecycle(emptyList())
@@ -124,6 +158,8 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         var draft by rememberSaveable { mutableStateOf("") }
         val attachments = remember { mutableStateListOf<String>() }
+        /** Where the camera button is, while the in-place camera card is open (it grows out of there). */
+        var cameraOrigin by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
         // Documents attached in chat: name -> (extracted text, page images)
         val docs = remember { mutableStateMapOf<String, Pair<String, List<String>>>() }
         val docPaths = remember { mutableStateMapOf<String, String>() }
@@ -185,7 +221,8 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(incomingNow) {
             val (text, open) = incomingNow
             if (text != null) { draft = text; nav.navigate("chat") { launchSingleTop = true } }
-            if (open != null) nav.navigate(open)
+            // An unknown screen name (from a shortcut, an adb call or another app) is ignored; it must never take the app down.
+            if (open != null) runCatching { nav.navigate(open) }
             if (text != null || open != null) incoming.value = null to null
         }
         // Read new replies aloud when the user asked for that.
@@ -200,6 +237,8 @@ class MainActivity : ComponentActivity() {
             if (last.kind == "voice" && ears) g.autoPlayVoice(org.json.JSONObject(last.meta).optString("path"), last.id)
         }
 
+        // Start CameraX early (no camera is opened, no permission is asked) so the camera card opens fast.
+        LaunchedEffect(route) { if (route == "chat") com.past9.phoneaos.camera.CameraWarm.warm(this@MainActivity) }
         val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) nav.navigate("call") }
         fun startCall() { if (androidx.core.content.ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) nav.navigate("call") else micPerm.launch(Manifest.permission.RECORD_AUDIO) }
         val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { conn = conn.copy(notificationsAllowed = it) }
@@ -255,14 +294,24 @@ class MainActivity : ComponentActivity() {
             if (ck != null && com.past9.phoneaos.tools.ComposioConnect.isConsumerKey(ck)) {
                 // Composio Connect can't list its catalogue: show the popular apps (plus anything found by search) and ask for their status.
                 val cc = com.past9.phoneaos.tools.ComposioConnect
-                val apps = (com.past9.phoneaos.tools.AppCatalog.popular + conn.toolkits).distinctBy { it.slug }
+                // Plus the account's own apps and anything connected beyond the popular list, as Composio's replies showed them.
+                val catalog = com.past9.phoneaos.tools.AppCatalog
+                val apps = (catalog.popular + catalog.known(g.settings.composioApps()) + conn.toolkits).distinctBy { it.slug }
                 conn = conn.copy(consumer = true, toolkits = apps)
+                fun rows(st: Map<String, List<com.past9.phoneaos.tools.ComposioConnect.Account>>) = st.values.flatten().filter { it.status == "ACTIVE" }
+                    .map { a -> com.past9.phoneaos.tools.Connection(a.id, a.slug, a.status, a.label.ifBlank { a.slug }) }
                 try {
                     val st = cc.accounts(ck, apps.map { it.slug })
                     // One row per signed-in account: four Gmails show as four lines, each with its email.
-                    conn = conn.copy(loading = false, connected = st.values.flatten().filter { it.status == "ACTIVE" }.map { a -> com.past9.phoneaos.tools.Connection(a.id, a.slug, a.status, a.label.ifBlank { a.slug }) })
+                    conn = conn.copy(loading = false, connected = rows(st))
                     // A started-but-unfinished sign-in is just an expired link here: the app stays in the list with Connect.
                 } catch (e: Exception) { conn = conn.copy(loading = false, error = "Couldn't reach Composio: ${e.message}") }
+                // Then look for apps made for this account (they're in no catalogue) and add any new ones with their accounts.
+                runCatching {
+                    cc.discoverOwnApps(ck)
+                    val found = catalog.known(g.settings.composioApps()).filter { t -> conn.toolkits.none { it.slug == t.slug } }
+                    if (found.isNotEmpty()) conn = conn.copy(toolkits = conn.toolkits + found, connected = conn.connected + rows(cc.accounts(ck, found.map { it.slug })))
+                }
                 return@launch
             }
             try {
@@ -340,6 +389,7 @@ class MainActivity : ComponentActivity() {
                             onThreads = { threadsOpen = true },
                             threadBadges = unreadByChat.filterKeys { it != activeChat }.values.sum(),
                             onCard = { openCard = it },
+                            onAct = { g.stopSpeaking(); com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity); g.runtime.sendQuiet(it) },
                             onSend = { g.stopSpeaking(); com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity)
                                 val docText = docs.entries.joinToString("") { (n, d) -> "\n\n[Attached document: $n${docPaths[n]?.let { p -> ", file saved at $p (you can upload it with browser_upload)" }.orEmpty()}]\n${d.first.take(30_000)}" }
                                 g.runtime.send(it + docText, attachments.toList() + docs.values.flatMap { d -> d.second }.take(6), docs.keys.toList())
@@ -348,7 +398,7 @@ class MainActivity : ComponentActivity() {
                                 val docText = docs.entries.joinToString("") { (n, d) -> "\n\n[Attached document: $n${docPaths[n]?.let { p -> ", file saved at $p (you can upload it with browser_upload)" }.orEmpty()}]\n${d.first.take(30_000)}" }
                                 g.runtime.send(it + docText, attachments.toList() + docs.values.flatMap { d -> d.second }.take(6), docs.keys.toList(), voiceReply = true)
                                 attachments.clear(); docs.clear() }, onStop = { g.runtime.stop() },
-                            onAttachDoc = { docPicker.launch(arrayOf("*/*")) }, onRemoveDoc = { docs.remove(it) },
+                            onAttachDoc = { docPicker.launch(arrayOf("*/*")) }, onCamera = { cameraOrigin = it }, onRemoveDoc = { docs.remove(it) },
                             onAttach = { picker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                             onRemoveAttachment = { attachments.remove(it) }, onModel = { openModels() }, onCall = if (settings.liveEnabled) ({ startCall() }) else null, onStopSpeaking = if (speakingNow) ({ g.stopSpeaking() }) else null,
                             onAnswer = { id, o -> g.runtime.answer(id, o) },
@@ -374,7 +424,11 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 composable("report?path={path}") { e ->
-                    ReportScreen(e.arguments?.getString("path").orEmpty(), onBack = { nav.popBackStack() })
+                    // A button in a report's cards asks the agent, like in the chat.
+                    androidx.compose.runtime.CompositionLocalProvider(com.past9.phoneaos.ui.openui.LocalOpenUiSend provides { msg -> g.runtime.send(msg); nav.navigate("chat") },
+                        com.past9.phoneaos.ui.openui.LocalOpenUiAct provides { msg -> g.runtime.sendQuiet(msg); nav.navigate("chat") }) {
+                        ReportScreen(e.arguments?.getString("path").orEmpty(), onBack = { nav.popBackStack() })
+                    }
                 }
                 composable("tasks") {
                     TasksScreen(goals, tasks, bottomPadding = barPad, actions = TaskActions(
@@ -386,12 +440,29 @@ class MainActivity : ComponentActivity() {
                     ))
                 }
                 composable("memory") {
-                    MemoryScreen(memories, bottomPadding = barPad, actions = MemoryActions(
+                    // A landscape tablet shows the list and a page side by side; a phone opens the page full screen.
+                    val twoPane = com.past9.phoneaos.ui.widthClass() == com.past9.phoneaos.ui.WidthClass.EXPANDED
+                    var openId by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<Long?>(null) }
+                    val memoryActions = MemoryActions(
                         onBack = { nav.popBackStack() },
-                        onOpen = { m -> nav.navigate("page/${m.id}") },
+                        onOpen = { m -> if (twoPane) openId = m.id else nav.navigate("page/${m.id}") },
                         onSave = { m -> scope.launch { if (m.id == 0L) g.db.memory().insert(m) else g.db.memory().update(m) } },
                         onDelete = { m -> scope.launch { g.db.memory().delete(m.id) } },
-                    ))
+                        onExport = { uri, done -> scope.launch {
+                            val note = runCatching { this@MainActivity.contentResolver.openOutputStream(uri)!!.use { com.past9.phoneaos.data.MemoryTransfer.export(g.db.memory(), it) } }
+                                .fold({ com.past9.phoneaos.ui.screens.TransferNote.exported(it) }, { com.past9.phoneaos.ui.screens.TransferNote.failed("Couldn't save the zip", it.message) })
+                            done(note) } },
+                        onImport = { uri, done -> scope.launch {
+                            val name = runCatching { this@MainActivity.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null } }.getOrNull() ?: uri.lastPathSegment ?: "memory.zip"
+                            val note = runCatching { this@MainActivity.contentResolver.openInputStream(uri)!!.use { com.past9.phoneaos.data.MemoryTransfer.importFrom(name, it, g.db.memory()) } }
+                                .fold({ com.past9.phoneaos.ui.screens.TransferNote.imported(it) }, { com.past9.phoneaos.ui.screens.TransferNote.failed("Couldn't read that file", it.message) })
+                            done(note) } },
+                    )
+                    if (!twoPane) MemoryScreen(memories, bottomPadding = barPad, actions = memoryActions)
+                    else MemoryTwoPane(memories, openId, { openId = it }, memoryActions, barPad,
+                        onOpenTitle = { t -> val target = memories.firstOrNull { it.title.equals(t, true) }
+                            if (target != null) openId = target.id else { g.runtime.send("Start a memory page about $t with what you know."); nav.navigate("chat") } },
+                        onAsk = { p -> g.runtime.send(p); nav.navigate("chat") })
                 }
                 composable("page/{id}") { e ->
                     val id = e.arguments?.getString("id")?.toLongOrNull()
@@ -414,11 +485,15 @@ class MainActivity : ComponentActivity() {
                 composable("connections") {
                     LaunchedEffect(Unit) { refreshConnections() }
                     val machines by g.runtime.machines.store.machines.collectAsStateWithLifecycle()
+                    val learnedApps by g.runtime.learned.apps.collectAsStateWithLifecycle()
                     // Re-read on every return to this screen: the user may have just switched All files access on.
                     val resumed = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsStateWithLifecycle().value
                     val phoneFiles = remember(resumed) { com.past9.phoneaos.tools.phoneFilesAllowed() }
-                    ConnectionsScreen(conn.copy(machines = machines, phoneFiles = phoneFiles, profiles = profileList, rules = accountRules, browserProfiles = settings.browserProfiles), bottomPadding = barPad + 24.dp, actions = ConnectionsActions(
+                    ConnectionsScreen(conn.copy(machines = machines, phoneFiles = phoneFiles, profiles = profileList, rules = accountRules, browserProfiles = settings.browserProfiles, learned = learnedApps), bottomPadding = barPad + 24.dp, actions = ConnectionsActions(
                         profile = profileActions,
+                        onTrustLearned = { id, on -> g.runtime.learned.setTrusted(id, on) },
+                        onRemoveLearned = { id -> g.runtime.learned.remove(id) },
+                        onTeach = { what -> g.runtime.send("Teach yourself this web app so you can use it without clicking through it every time: $what. Read webapp_guide first, check webapp_list, then map it in the browser and save the tools you write with webapp_save."); nav.navigate("chat") },
                         onKeepOne = { keep, remove -> scope.launch {
                             val ck = g.settings.composioKey()?.trim()
                             remove.forEach { c ->
@@ -508,7 +583,10 @@ class MainActivity : ComponentActivity() {
                     var p by remember { mutableStateOf(settings.provider) }
                     androidx.compose.material3.Surface(color = androidx.compose.material3.MaterialTheme.colorScheme.surface) {
                         androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.systemBarsPadding()) {
-                            KeyStep(p, { p = it }, onboardingActions(g)) { g.settings.setProvider(p); g.settings.setMode(PowerMode.API_KEY); nav.popBackStack() }
+                            // Changing the key of an Other server: its address and model are already filled in.
+                            val other = p == Provider.CUSTOM && settings.provider == Provider.CUSTOM
+                            KeyStep(p, { p = it }, onboardingActions(g), initialBaseUrl = if (other) settings.baseUrl else "", initialModel = if (other) settings.model else "") {
+                                g.settings.setProvider(p); g.settings.setMode(PowerMode.API_KEY); nav.popBackStack() }
                         }
                     }
                 }
@@ -551,13 +629,14 @@ class MainActivity : ComponentActivity() {
                 CardSheet(c, androidx.compose.foundation.isSystemInDarkTheme(), settings.accent, CardSheetActions(
                     onRefresh = { card -> refreshingCard = card.id; scope.launch {
                         val r = com.past9.phoneaos.cards.CardScripts.run(this@MainActivity, card)
-                        g.cards.update(card.id) { x -> if (r.ok) x.copy(data = r.data!!, headline = com.past9.phoneaos.cards.CardScripts.headlineFrom(r.data) ?: x.headline, updatedAt = System.currentTimeMillis(), error = "") else x.copy(error = r.log.takeLast(400)) }
+                        g.cards.update(card.id) { x -> if (r.ok) x.withData(r.data!!) else x.copy(error = r.log.takeLast(400)) }
                         refreshingCard = null } },
                     onPin = { card, on -> g.cards.update(card.id) { it.copy(pinned = on) } },
                     onAsk = { card, text -> openCard = null; g.runtime.send("[About the card \"${card.title}\" (id ${card.id})] $text"); nav.navigate("chat") },
+                    onAct = { card, text -> openCard = null; g.runtime.sendQuiet("[About the card \"${card.title}\" (id ${card.id})] $text"); nav.navigate("chat") },
                     onOpenLink = { url -> scope.launch { com.past9.phoneaos.system.UiBus.openInBrowser.emit(com.past9.phoneaos.system.UiBus.OpenInBrowser(url)) } },
                     onRun = { card, input -> val r = com.past9.phoneaos.cards.CardScripts.run(this@MainActivity, card, input)
-                        if (r.ok) { g.cards.update(card.id) { it.copy(data = r.data!!, updatedAt = System.currentTimeMillis()) }; true to r.data!! } else false to org.json.JSONObject().put("error", r.log.takeLast(300)).toString() },
+                        if (r.ok) { g.cards.update(card.id) { it.withData(r.data!!) }; true to r.data!! } else false to org.json.JSONObject().put("error", r.log.takeLast(300)).toString() },
                 ), onDismiss = { openCard = null }, refreshing = refreshingCard == c.id)
             }
             if (modelSheet && pickingHelper) HelperRosterSheet(
@@ -573,6 +652,15 @@ class MainActivity : ComponentActivity() {
                     modelSheet = false
                 }, onDismiss = { modelSheet = false },
                 subtitle = if (pickingHelper) "Your agent plans and hands the work to helpers. Pick what they run on." else null)
+            LaunchedEffect(route) { if (route != "chat") cameraOrigin = null }
+            cameraOrigin?.let { o ->
+                com.past9.phoneaos.camera.CameraCard(o, onClosed = { cameraOrigin = null },
+                    onSend = { path, caption ->
+                        g.stopSpeaking(); com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity)
+                        g.runtime.send(caption, listOf(path), emptyList())
+                    },
+                    onGallery = { cameraOrigin = null; picker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) })
+            }
             androidx.compose.animation.AnimatedVisibility(route in barRoutes, modifier = androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.BottomCenter),
                 enter = androidx.compose.animation.slideInVertically { it } + androidx.compose.animation.fadeIn(), exit = androidx.compose.animation.slideOutVertically { it } + androidx.compose.animation.fadeOut()) {
                 HomeBar(route, ::go, onTalk = { nav.navigate("chat") })
@@ -605,6 +693,7 @@ class MainActivity : ComponentActivity() {
                 if (sub.signedIn) { g.settings.setSubKind(kind); g.settings.setMode(PowerMode.SUBSCRIPTION) } else signErr = err ?: "Sign-in didn't finish. Tap Sign in to try again." } },
             onInstall = { scope.launch { installing = true; runCatching { sub.install { l -> scope.launch { log += l } } }.onFailure { log += "Failed: ${it.message}" }; installing = false; info = sub.info() } },
             onSaveToken = { t -> runCatching { sub.setToken(t); g.settings.setSubKind(kind); g.settings.setMode(PowerMode.SUBSCRIPTION) }.onFailure { signErr = it.message }; info = sub.info() },
+            onSignOut = { sub.signOut(); signErr = null; info = sub.info() },
             onUseKey = onUseKey)
     }
 

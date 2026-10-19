@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.debounce
 
 /** Everything long-lived, built once per process. */
 class Graph(context: Context) {
@@ -35,7 +36,15 @@ class Graph(context: Context) {
         scope.launch { runCatching { com.past9.phoneaos.triggers.Overnight.ensureRoutine(this@Graph) } }
         // Anything scheduled that was missed while the app was dead runs once now.
         scope.launch { runCatching { Routines.catchUp(app) } }
+        // Reminders follow the to-do list: any open to-do with a due time rings then, by itself.
+        scope.launch { db.tasks().tasks().debounce(1500).collect { runCatching { com.past9.phoneaos.triggers.Reminders.syncAll(app) } } }
+        // Wakes (reasoned, self-scheduled follow-ups and the calendar's meeting wakes): armed again on every start, so a
+        // killed or updated app never loses its next one. Plain code, no AI.
+        scope.launch { runCatching { com.past9.phoneaos.triggers.Wakes.rearm(app) } }
         // A consumer (ck_) Composio key: fetch Composio Connect's tools so the agent has them.
+        com.past9.phoneaos.tools.ComposioConnect.onActiveApps = { settings.rememberComposioApps(it) }
+        // Only the account's own apps need their tools spelled out; the catalogue ones are known by name.
+        com.past9.phoneaos.tools.ComposioConnect.onAppTools = { t -> t.filterKeys { it.startsWith("custom_") }.takeIf { it.isNotEmpty() }?.let { settings.rememberComposioAppTools(it) } }
         settings.composioKey()?.takeIf { com.past9.phoneaos.tools.ComposioConnect.isConsumerKey(it) }?.let { k -> scope.launch { com.past9.phoneaos.tools.ComposioConnect.load(k.trim()) } }
     }
     val call by lazy { com.past9.phoneaos.voice.CallController(app, db, settings, runtime, scope) }

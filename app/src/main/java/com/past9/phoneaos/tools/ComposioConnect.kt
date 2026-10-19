@@ -95,6 +95,55 @@ object ComposioConnect {
         }.getOrElse { session = null; sessionKey = null; it.message ?: "Couldn't reach Composio Connect" }
     }
 
+    /**
+     * Apps the account has an active connection to, as they turn up in any reply (slug -> Composio's description).
+     * Composio Connect can't list an account's apps, so whoever sets this keeps them (Connections shows them).
+     */
+    @Volatile var onActiveApps: (Map<String, String>) -> Unit = {}
+
+    /** The tools a search showed for each app (slug -> tool slugs): what the account's own apps can do. */
+    @Volatile var onAppTools: (Map<String, List<String>>) -> Unit = {}
+
+    /** A reply's JSON: the first block (Composio can add a plain-text hint after it). */
+    private fun replyData(text: String): JSONObject? = runCatching { org.json.JSONTokener(text).nextValue() as? JSONObject }.getOrNull()?.optJSONObject("data")
+
+    /** Every app a reply shows with an active connection: a search's connection statuses, or the toolkits a list returned. */
+    fun activeApps(text: String): Map<String, String> {
+        val d = replyData(text) ?: return emptyMap()
+        val out = mutableMapOf<String, String>()
+        d.optJSONArray("toolkit_connection_statuses")?.let { a ->
+            for (i in 0 until a.length()) a.optJSONObject(i)?.takeIf { it.optBoolean("has_active_connection") }?.let { out[it.optString("toolkit")] = it.optString("description") }
+        }
+        d.optJSONObject("results")?.let { r -> r.keys().forEach { k -> r.optJSONObject(k)?.takeIf { it.optString("status").equals("active", true) }?.let { out.putIfAbsent(k, "") } } }
+        return out.filterKeys { it.isNotBlank() }
+    }
+
+    /** The tool slugs a search found, under the app each belongs to (CUSTOM_RECIPES_GET_RECIPE -> custom_recipes). */
+    fun appTools(text: String): Map<String, List<String>> {
+        val results = replyData(text)?.optJSONArray("results") ?: return emptyMap()
+        val out = mutableMapOf<String, MutableSet<String>>()
+        for (i in 0 until results.length()) {
+            val r = results.optJSONObject(i) ?: continue
+            val kits = r.optJSONArray("toolkits")?.let { a -> (0 until a.length()).map { a.optString(it) } }.orEmpty().filter { it.isNotBlank() }
+            listOf("primary_tool_slugs", "related_tool_slugs").forEach { k -> r.optJSONArray(k)?.let { a -> for (j in 0 until a.length()) {
+                val tool = a.optString(j)
+                kits.firstOrNull { tool.startsWith(it.uppercase() + "_") }?.let { out.getOrPut(it) { linkedSetOf() } += tool }
+            } } }
+        }
+        return out.mapValues { it.value.toList() }
+    }
+
+    private fun search(useCase: String) = JSONObject().put("queries", JSONArray().put(JSONObject().put("use_case", useCase)))
+
+    /**
+     * Apps made for this account (custom toolkits) are in no catalogue and never searched for by name: one search turns them up,
+     * and one more per app shows its main tools (they say what it's for: a question about recipes belongs to the app with GET_RECIPE).
+     */
+    suspend fun discoverOwnApps(key: String) {
+        val own = activeApps(call(key, "COMPOSIO_SEARCH_TOOLS", search("custom toolkit"))).keys.filter { it.startsWith("custom_") }
+        own.forEach { slug -> call(key, "COMPOSIO_SEARCH_TOOLS", search("use the $slug app")) }
+    }
+
     suspend fun call(key: String, name: String, args: JSONObject): String = lock.withLock {
         suspend fun once(): String {
             ensureSession(key)
@@ -105,6 +154,10 @@ object ComposioConnect {
         }
         // Sessions expire: start a fresh one once before giving up.
         runCatching { once() }.getOrElse { session = null; sessionKey = null; runCatching { once() }.getOrElse { "Error: ${it.message}" } }
+            .also { text ->
+                activeApps(text).takeIf { it.isNotEmpty() }?.let { runCatching { onActiveApps(it) } }
+                appTools(text).takeIf { it.isNotEmpty() }?.let { runCatching { onAppTools(it) } }
+            }
     }
 
     /** A Composio Connect tool's JSON reply ({data, error, successful}), as its data object. */
@@ -132,7 +185,7 @@ object ComposioConnect {
                 val arr = res.optJSONObject(slug)?.optJSONArray("accounts") ?: JSONArray()
                 out[slug] = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { a ->
                     Account(a.optString("id"), slug, if (a.optString("status").equals("active", true)) "ACTIVE" else "INITIATED",
-                        identity(a), a.optString("alias").takeIf { it != "null" } ?: "", a.optBoolean("is_default"))
+                        identity(a).ifBlank { workspaceLabel(slug, a.optString("id")) }, a.optString("alias").takeIf { it != "null" } ?: "", a.optBoolean("is_default"))
                 }.sortedBy { if (it.status == "ACTIVE") 0 else 1 }
             }
         }
@@ -144,11 +197,24 @@ object ComposioConnect {
      * or name, under whatever key that app uses, so look for the usual ones before giving up.
      */
     fun identity(a: JSONObject): String {
-        val keys = listOf("email", "username", "login", "user_name", "screen_name", "handle", "display_name", "name", "team_name", "workspace")
+        val keys = listOf("email", "username", "login", "user_name", "screen_name", "handle", "display_name", "name", "team_name", "workspace_name", "workspace", "team_domain", "domain", "enterprise_name", "team_id")
         fun pick(o: JSONObject?): String? = o?.let { obj -> keys.firstNotNullOfOrNull { k -> obj.optString(k).takeIf { v -> v.isNotBlank() && v != "null" } } }
-        return pick(a.optJSONObject("user_info")) ?: pick(a.optJSONObject("user_info")?.optJSONObject("user"))
-            ?: pick(a.optJSONObject("data")) ?: pick(a.optJSONObject("profile")) ?: ""
+        // Slack keeps the workspace under a "team" object, next to the user; look in each place a workspace name can sit.
+        val info = a.optJSONObject("user_info"); val data = a.optJSONObject("data")
+        // Slack puts the workspace NAME in a plain "team" string next to team_id; checking team_id first showed T05Q8NEMWCU.
+        val teamName = (info?.opt("team") as? String)?.takeIf { it.isNotBlank() && it != "null" }
+        return teamName ?: pick(info) ?: pick(info?.optJSONObject("user")) ?: pick(info?.optJSONObject("team")) ?: pick(data) ?: pick(data?.optJSONObject("team"))
+            ?: pick(data?.optJSONObject("authed_user")) ?: pick(a.optJSONObject("profile")) ?: pick(a.optJSONObject("team")) ?: ""
     }
+
+    /**
+     * Apps where one person has several workspaces or organisations (Slack, Notion, Teams...). When Composio doesn't
+     * say which workspace an account is, a second one used to look like a copy of the first: no Add button, and a new
+     * sign-in was dropped as a duplicate. Each gets its own label instead, so they can all be connected.
+     */
+    val WORKSPACE_APPS = setOf("slack", "notion", "discord", "microsoft_teams", "microsoftteams", "teams", "asana", "clickup", "linear", "jira", "trello", "airtable", "hubspot", "shopify", "figma")
+    fun workspaceLabel(slug: String, id: String): String =
+        if (slug in WORKSPACE_APPS && id.isNotBlank()) "${slug.replace('_', ' ').replaceFirstChar { it.uppercase() }} workspace ${id.takeLast(4)}" else ""
 
     /** Two accounts of one app are the same sign-in when they name the same person, or neither names anyone. */
     fun sameAccount(a: Account, b: Account) = a.slug == b.slug && a.email.trim().equals(b.email.trim(), true)

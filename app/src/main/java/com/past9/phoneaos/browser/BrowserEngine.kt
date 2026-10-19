@@ -46,10 +46,23 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
     @Volatile var lastUsed = System.currentTimeMillis(); private set
     /** Something the agent should know about the page that the page itself won't say (a blocked sign-in, a download). */
     @Volatile var notice: String? = null
+    /** How the last main-page load ended, for [SiteHealth]: the HTTP status the site answered with, or the browser's load error. */
+    @Volatile var lastStatus: Int? = null; private set
+    @Volatile var lastError: String? = null; private set
+    /** Counts page loads that have started, so a caller can tell the page it asked for from the one that was already finishing. */
+    @Volatile var navSeq = 0; private set
     /** Files the agent wants to hand to the next file picker a page opens (browser_upload). */
     @Volatile var pendingUpload: List<android.net.Uri>? = null
     @Volatile var uploadsServed = 0
     val attached: Boolean get() = container != null
+    /** What the page said on its console, newest last (for browser_console). */
+    val consoleLog = java.util.concurrent.ConcurrentLinkedDeque<String>()
+    /** Requests the browser itself made while network logging is on: all of them, with headers (for browser_network). */
+    class NativeReq(val at: Long, val method: String, val url: String, val headers: String)
+    val nativeLog = java.util.concurrent.ConcurrentLinkedDeque<NativeReq>()
+    @Volatile var netOn = false
+    private var phoneUa: String? = null
+    @Volatile var desktop = false; private set
     fun touch() { lastUsed = System.currentTimeMillis() }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -76,6 +89,7 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
         settings.setGeolocationEnabled(true)
         // Look like Chrome, not an embedded WebView: Google refuses sign-in to "; wv" user agents.
         settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\d+(\\.\\d+)* "), "")
+        if (phoneUa == null) phoneUa = settings.userAgentString
         val xrw = androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)
         if (xrw) runCatching { androidx.webkit.WebSettingsCompat.setRequestedWithHeaderOriginAllowList(settings, emptySet()) }
             .onFailure { android.util.Log.w("AgentBrowser", "X-Requested-With allow-list failed", it) }
@@ -100,6 +114,11 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
         cookies.setAcceptCookie(true)
         cookies.setAcceptThirdPartyCookies(this, true)
         webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onConsoleMessage(m: android.webkit.ConsoleMessage): Boolean {
+                consoleLog.add("${m.messageLevel().name.lowercase()}: ${m.message().take(400)}  (${m.sourceId().substringAfterLast('/').take(60)}:${m.lineNumber()})")
+                while (consoleLog.size > 200) consoleLog.pollFirst()
+                return true
+            }
             // Sites that ask for the location (store finders, delivery) get the phone's, once the app has it.
             override fun onGeolocationPermissionsShowPrompt(origin: String, callback: android.webkit.GeolocationPermissions.Callback) {
                 com.past9.phoneaos.App.graph(context).scope.launch {
@@ -145,7 +164,7 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
         // Web notifications: WebView has none, so give pages one that hands them to the app.
         addJavascriptInterface(WebNotifications(context, profile), "__aosWeb")
         if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT))
-            runCatching { androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, WebNotifications.SHIM, setOf("*")) }
+            runCatching { androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, WebNotifications.SHIM, setOf("*")); androidx.webkit.WebViewCompat.addDocumentStartJavaScript(this, com.past9.phoneaos.connections.PageJs.NET_SHIM, setOf("*")) }
         webViewClient = object : WebViewClient() {
             // Links into other apps (intent://, market://, mailto:) used to load as a blank error page.
             override fun shouldOverrideUrlLoading(view: WebView, request: android.webkit.WebResourceRequest): Boolean {
@@ -167,8 +186,19 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
                 return true
             }
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                if (view === web) { _page.value = PageState(url, view.title ?: "", true); notice = null }
-                if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) view.evaluateJavascript(WebNotifications.SHIM, null)
+                if (view === web) { _page.value = PageState(url, view.title ?: "", true); notice = null; lastStatus = null; lastError = null; navSeq++ }
+                if (!androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) { view.evaluateJavascript(WebNotifications.SHIM, null); view.evaluateJavascript(com.past9.phoneaos.connections.PageJs.NET_SHIM, null) }
+            }
+            // While network logging is on, note every request the browser makes (pages, scripts, workers, frames), with its headers.
+            override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                if (netOn) noteRequest(request)
+                return null
+            }
+            override fun onReceivedHttpError(view: WebView, request: android.webkit.WebResourceRequest, errorResponse: android.webkit.WebResourceResponse) {
+                if (view === web && request.isForMainFrame) lastStatus = errorResponse.statusCode
+            }
+            override fun onReceivedError(view: WebView, request: android.webkit.WebResourceRequest, error: android.webkit.WebResourceError) {
+                if (view === web && request.isForMainFrame) lastError = "${error.description} (${error.errorCode})"
             }
             override fun onPageFinished(view: WebView, url: String) {
                 if (view === web) { _page.value = PageState(url, view.title ?: "", false); pageDone?.complete(Unit) }
@@ -178,6 +208,70 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
                         notice = "Google refused this sign-in inside this browser. Use the site's email or password option instead, or hand the browser to the user (browser_handoff) to try."
                 }
             }
+        }
+    }
+
+    private val staticExt = Regex("\\.(png|jpe?g|gif|webp|svg|ico|css|woff2?|ttf|otf|mp4|webm|mp3|m4a|avif|map)(\\?|$)", RegexOption.IGNORE_CASE)
+    private val secretHeader = Regex("authorization|cookie|csrf|xsrf|token|api[-_]?key|secret|session|signature", RegexOption.IGNORE_CASE)
+
+    private fun noteRequest(r: android.webkit.WebResourceRequest) {
+        val url = r.url.toString()
+        val accept = r.requestHeaders["Accept"].orEmpty()
+        if (staticExt.containsMatchIn(url) || accept.startsWith("image/") || accept.startsWith("text/css") || url.startsWith("data:") || url.startsWith("blob:")) return
+        // Header names always; values only for harmless ones, short. Anything that could carry a login is shown as [set].
+        val headers = r.requestHeaders.entries.joinToString("; ") { (k, v) -> if (secretHeader.containsMatchIn(k)) "$k=[set]" else if (k.equals("User-Agent", true) || k.equals("Accept-Language", true) || k.equals("Accept-Encoding", true)) k else "$k=${v.take(60)}" }
+        nativeLog.add(NativeReq(System.currentTimeMillis(), r.method, url.take(300), headers.take(500)))
+        while (nativeLog.size > 300) nativeLog.pollFirst()
+    }
+
+    /** Run script text in the page as the app itself (no site security policy applies); returns what it evaluates to, as JSON. */
+    suspend fun evalRaw(script: String): String = onMain<String> { w, cb -> w.evaluateJavascript(script) { cb(it ?: "null") } } ?: "timeout"
+
+    /** Evaluate [body] (an async function body that sees `args`) in the page and wait for what it returns, as JSON {ok,v} or {ok:false,e}. */
+    suspend fun runAsync(body: String, args: JSONObject, timeoutMs: Long = 30_000): String {
+        val P = com.past9.phoneaos.connections.PageJs
+        val slot = "__aosR" + System.nanoTime()
+        when (P.text(js(P.start(slot, body, args)))) {
+            "timeout" -> return """{"ok":false,"e":"The page didn't respond"}"""
+            "blocked" -> {
+                // This site forbids building a function from text. Inject the body as script text instead.
+                js(P.pending(slot)); evalRaw(P.direct(slot, body, args)); kotlinx.coroutines.delay(250)
+                if (js(P.startedState(slot)) == "0") { js(P.clear(slot)); return """{"ok":false,"e":"Syntax: the body doesn't parse (${body.length} characters)"}""" }
+            }
+        }
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) {
+            val r = js(com.past9.phoneaos.connections.PageJs.poll(slot))
+            if (r != "null" && r != "timeout") { js(com.past9.phoneaos.connections.PageJs.clear(slot)); return r }
+            kotlinx.coroutines.delay(200)
+        }
+        js(com.past9.phoneaos.connections.PageJs.clear(slot))
+        return """{"ok":false,"e":"Timed out after ${timeoutMs / 1000}s"}"""
+    }
+
+    /** "" when [body] parses as an async function body, else the error. */
+    suspend fun syntaxError(body: String): String = com.past9.phoneaos.connections.PageJs.text(js(com.past9.phoneaos.connections.PageJs.syntax(body))).let { if (it == "timeout") "" else it }
+
+    /** Start or stop recording what the site sends (the page's fetch/XHR/WebSocket calls and the browser's own requests). */
+    suspend fun netControl(on: Boolean) {
+        netOn = on
+        if (on) { nativeLog.clear(); js(com.past9.phoneaos.connections.PageJs.netClear()) }
+        js(if (on) com.past9.phoneaos.connections.PageJs.netStart() else com.past9.phoneaos.connections.PageJs.netStop())
+    }
+
+    /** Switch between a phone browser and a desktop one (WhatsApp Web, and others, refuse a phone). Reload the page after. */
+    suspend fun setDesktop(on: Boolean) {
+        desktop = on
+        onMain<Unit> { w, cb ->
+            val st = w.settings
+            val full = Regex("Chrome/([\\d.]+)").find(st.userAgentString)?.groupValues?.get(1) ?: "143.0.0.0"
+            st.userAgentString = if (on) "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$full Safari/537.36" else (phoneUa ?: st.userAgentString)
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.USER_AGENT_METADATA)) runCatching {
+                androidx.webkit.WebSettingsCompat.setUserAgentMetadata(st, androidx.webkit.UserAgentMetadata.Builder(androidx.webkit.WebSettingsCompat.getUserAgentMetadata(st))
+                    .setMobile(!on).setPlatform(if (on) "Linux" else "Android").build())
+            }
+            st.useWideViewPort = true; st.loadWithOverviewMode = true
+            cb(Unit)
         }
     }
 
@@ -246,6 +340,29 @@ class BrowserEngine(private val context: Context, val profile: String = "Persona
     suspend fun js(expr: String): String = onMain<String> { w, cb ->
         w.evaluateJavascript("(function(){try{return JSON.stringify($expr)}catch(e){return JSON.stringify('ERR '+e)}})()") { cb(it ?: "null") }
     }?.let { raw -> runCatching { org.json.JSONTokener(raw).nextValue().toString() }.getOrDefault(raw) } ?: "timeout"
+
+    /** Visible text of the page, for judging whether the site let us in. */
+    suspend fun visibleText(): String = com.past9.phoneaos.connections.PageJs.text(js("(document.body&&document.body.innerText||'').slice(0,3000)")).let { if (it == "timeout") "" else it }
+
+    /** This engine as the adaptive opener sees it. */
+    val port: SitePort get() = object : SitePort {
+        override val desktop get() = this@BrowserEngine.desktop
+        override suspend fun setDesktop(on: Boolean) = this@BrowserEngine.setDesktop(on)
+        override suspend fun load(url: String): Loaded {
+            val before = navSeq
+            goto(url)
+            // goto returns when ANY page finishes, which can be the one that was already loading. Wait for the page just asked for.
+            val end = System.currentTimeMillis() + 25_000
+            while ((navSeq == before || _page.value.loading) && System.currentTimeMillis() < end) kotlinx.coroutines.delay(250)
+            kotlinx.coroutines.delay(800)
+            var text = visibleText()
+            // Heavy single-page sites draw late: give an empty page one more chance before calling it a refusal.
+            if (text.trim().length < 25 && lastStatus == null) { kotlinx.coroutines.delay(3_500); text = visibleText() }
+            val p = _page.value
+            return Loaded(p.url, p.title, lastStatus, lastError, text)
+        }
+        override suspend fun snapshot() = this@BrowserEngine.snapshot()
+    }
 
     /** Number every visible interactive element and return a compact, readable outline of the page. */
     suspend fun snapshot(maxChars: Int = 14_000): String {

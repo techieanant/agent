@@ -1,5 +1,7 @@
 package com.past9.phoneaos.ui.screens
 
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.AnimatedVisibility
@@ -72,6 +74,8 @@ import java.io.File
 
 data class ChatActions(
     val onSend: (String) -> Unit = {},
+    /** A tap on a card's button: to the agent in the background, no message from the user in the chat. Null: sent like a typed message. */
+    val onAct: ((String) -> Unit)? = null,
     /** Swipe-up send: the agent answers with a voice note. */
     val onSendVoice: (String) -> Unit = {},
     val onStop: () -> Unit = {},
@@ -82,6 +86,7 @@ data class ChatActions(
     val onProfile: () -> Unit = {},
     val onAttach: () -> Unit = {},
     val onAttachDoc: () -> Unit = {},
+    val onCamera: (androidx.compose.ui.geometry.Rect) -> Unit = {},
     val onRemoveDoc: (String) -> Unit = {},
     val onRemoveAttachment: (String) -> Unit = {},
     val onModel: () -> Unit = {},
@@ -145,8 +150,10 @@ fun withMarker(rows: List<Row_>, firstId: Long?, count: Int): List<Row_> {
 
 fun group(items: List<ChatItem>): List<Row_> {
     val out = mutableListOf<Row_>(); val buf = mutableListOf<ChatItem>(); val call = mutableListOf<ChatItem>()
+    /** Whether the running step buffer is a background routine's work, so a routine's steps never inflate the main agent's count. */
+    var bufRoutine: Boolean? = null
     fun flushCall() { if (call.isNotEmpty()) { out += Row_.Call(call.toList()); call.clear() } }
-    fun flush() { if (buf.isNotEmpty()) { out += Row_.Steps(buf.toList()); buf.clear() } }
+    fun flush() { if (buf.isNotEmpty()) { out += Row_.Steps(buf.toList()); buf.clear() }; bufRoutine = null }
     // A finished helper leaves the chat once the main agent has replied after it (its result lives in that reply).
     // If that reply never came (the turn failed), the helper stays so its result isn't lost.
     val lastAgentAt = items.filter { it.kind == "agent" }.maxOfOrNull { it.createdAt } ?: 0L
@@ -159,7 +166,12 @@ fun group(items: List<ChatItem>): List<Row_> {
             it.kind == "activity" && m.has("branch") -> {} // shown inside its branch's sheet
             // A helper only shows while it works: once it's done or stopped it leaves the chat; its result lives in the agent's reply.
             it.kind == "helper" && m.optString("state", "working").let { st -> st == "stopped" || (st != "working" && lastAgentAt > m.optLong("endedAt", Long.MAX_VALUE)) } -> {}
-            it.kind == "activity" && m.optString("image").isEmpty() && m.optString("file").isEmpty() -> buf += it
+            it.kind == "activity" && m.optString("image").isEmpty() && m.optString("file").isEmpty() -> {
+                val routine = m.optString("by") == "routine"
+                if (buf.isNotEmpty() && bufRoutine != routine) flush()
+                bufRoutine = routine
+                buf += it
+            }
             else -> { flush(); out += Row_.Single(it) }
         }
     }
@@ -268,15 +280,17 @@ fun ChatScreen(
     val newSince = items.count { it.id > seenId && it.kind != "user" && it.kind != "activity" && !JSONObject(it.meta).has("helper") }
     val waitingOnYou = items.any { it.kind == "question" && !JSONObject(it.meta).has("answer") }
 
+    // A tap on a generated UI's button (OpenUI @ToAssistant) goes to the agent quietly; a follow-up suggestion is sent like a typed message.
+    androidx.compose.runtime.CompositionLocalProvider(com.past9.phoneaos.ui.openui.LocalOpenUiSend provides actions.onSend, com.past9.phoneaos.ui.openui.LocalOpenUiAct provides actions.onAct) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.surface,
         topBar = { ChatTopBar(chatTitle, agentName, status, browserLive, waitingOnYou, openCount, actions, modelLabel) },
-        bottomBar = { Composer(draft, onDraft, status.working, actions, attachments, docs, listening) },
+        bottomBar = { Box(Modifier.fillMaxWidth().padding(horizontal = com.past9.phoneaos.ui.sidePad(0.dp, com.past9.phoneaos.ui.Readable.CHAT + 32.dp))) { Composer(draft, onDraft, status.working, actions, attachments, docs, listening) } },
     ) { pad ->
         if (items.isEmpty() || morning != null) Welcome(userName, Modifier.padding(pad), actions.onSend, morning, hasChat = items.isNotEmpty())
         else LazyColumn(
             state = list, modifier = Modifier.fillMaxSize().padding(pad),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
+            contentPadding = PaddingValues(start = com.past9.phoneaos.ui.sidePad(16.dp, com.past9.phoneaos.ui.Readable.CHAT), end = com.past9.phoneaos.ui.sidePad(16.dp, com.past9.phoneaos.ui.Readable.CHAT), top = 8.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             items(rows, key = { it.key }) { r ->
@@ -318,6 +332,7 @@ fun ChatScreen(
             }
         }
     }
+    }
 }
 
 /** The line above the first message he has not read yet. */
@@ -333,7 +348,7 @@ private fun NewMarker(count: Int) {
 @Composable
 private fun ChatTopBar(chatTitle: String, agentName: String, status: AgentStatus, browserLive: Boolean, needsYou: Boolean, openCount: Int, actions: ChatActions, modelLabel: String = "") {
     Surface(color = MaterialTheme.colorScheme.surface) {
-        Row(Modifier.fillMaxWidth().statusBarsPadding().padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().statusBarsPadding().padding(start = com.past9.phoneaos.ui.sidePad(16.dp, com.past9.phoneaos.ui.Readable.CHAT) - 8.dp, end = com.past9.phoneaos.ui.sidePad(16.dp, com.past9.phoneaos.ui.Readable.CHAT) - 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = actions.onMenu) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back to home") }
             if (actions.onThreads != null) {
                 BadgedBox(badge = { if (actions.threadBadges > 0) Badge { Text(if (actions.threadBadges > 9) "9+" else actions.threadBadges.toString()) } }) {
@@ -399,7 +414,7 @@ private fun Welcome(userName: String, modifier: Modifier, onSend: (String) -> Un
     )
     // Centred like the first-day screen, but it scrolls when the agent writes longer lines.
     BoxWithConstraints(modifier.fillMaxSize()) {
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).heightIn(min = maxHeight).padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.Center) {
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).heightIn(min = maxHeight).padding(horizontal = com.past9.phoneaos.ui.sidePad(24.dp, com.past9.phoneaos.ui.Readable.FORM + 48.dp), vertical = 16.dp), verticalArrangement = Arrangement.Center) {
         AgentAvatar(working = morning?.preparing == true, size = 88.dp)
         Spacer(Modifier.height(28.dp))
         Text(greeting, style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.onSurface)
@@ -483,7 +498,7 @@ private fun UserBubble(item: ChatItem) {
     }
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(24.dp, 24.dp, 6.dp, 24.dp), modifier = Modifier.widthIn(max = 320.dp).padding(start = 48.dp)) {
-            Text(text.substringBefore("\n\n[Attached document:").ifBlank { "Here's a document." }, Modifier.padding(horizontal = 16.dp, vertical = 11.dp), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onPrimaryContainer)
+            Text(text.substringBefore("\n\n[Attached document:").substringBefore("\n\n[Shared with you").ifBlank { "Here's a document." }, Modifier.padding(horizontal = 16.dp, vertical = 11.dp), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onPrimaryContainer)
         }
     }
 }
@@ -599,7 +614,10 @@ private fun StepsRow(items: List<ChatItem>) {
             Spacer(Modifier.width(10.dp))
             Text(last.text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = if (open) 3 else 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-            if (items.size > 1) Text("${items.size} steps", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(start = 8.dp))
+            if (items.size > 1) {
+                val routine = items.all { JSONObject(it.meta).optString("by") == "routine" }
+                Text(if (routine) "Routine · ${items.size} steps" else "${items.size} steps", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(start = 8.dp))
+            }
             if (items.size > 1) Icon(if (open) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, if (open) "Hide steps" else "Show steps", tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         AnimatedVisibility(open && (items.size > 1 || JSONObject(last.meta).has("result")), enter = expandVertically(spring(0.8f, 380f)) + fadeIn(), exit = shrinkVertically() + fadeOut()) {
@@ -698,20 +716,18 @@ val LocalStopHelper = androidx.compose.runtime.staticCompositionLocalOf<((Long) 
 fun QuestionCard(item: ChatItem, onAnswer: (Long, String) -> Unit, onBrowser: () -> Unit) {
     val meta = JSONObject(item.meta); val answer = meta.optString("answer")
     val opts = meta.optJSONArray("options")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
-    AppCard(container = if (answer.isEmpty()) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceContainerLow) {
-        Text(if (answer.isEmpty()) "NEEDS YOU" else "YOU ANSWERED", style = Eyebrow, color = if (answer.isEmpty()) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+    if (answer.isEmpty()) {
+        // Waiting on you: an OpenUI card with one button per answer, and always a No.
+        val why = meta.optString("why").takeIf { it.isNotBlank() }?.let { "${meta.optString("whyBy").ifBlank { "Your agent" }}: $it" }
+        com.past9.phoneaos.ui.openui.AskCard("Needs you", why, item.text, opts, { o -> if (o == "Open browser") onBrowser() else onAnswer(item.id, o) })
+        return
+    }
+    AppCard(container = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Text("YOU ANSWERED", style = Eyebrow, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
-        if (answer.isEmpty()) WhyLine(meta, MaterialTheme.colorScheme.onTertiaryContainer)
-        Text(item.text, style = MaterialTheme.typography.titleMedium, color = if (answer.isEmpty()) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onSurface)
+        Text(item.text, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
         Spacer(Modifier.height(14.dp))
-        if (answer.isNotEmpty()) StatusChip(answer)
-        else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            opts.forEachIndexed { i, o ->
-                val click = { if (o == "Open browser") onBrowser() else onAnswer(item.id, o) }
-                if (i == 0) Button(onClick = click, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), shapes = ButtonDefaults.shapes()) { Text(o) }
-                else OutlinedButton(onClick = click, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), shapes = ButtonDefaults.shapes()) { Text(o, color = MaterialTheme.colorScheme.onTertiaryContainer) }
-            }
-        }
+        StatusChip(answer)
     }
 }
 
@@ -728,10 +744,12 @@ private fun WhyLine(meta: JSONObject, color: androidx.compose.ui.graphics.Color)
 
 @Composable
 private fun StatusChip(text: String) {
+    val no = text == com.past9.phoneaos.agent.AskOptions.NO
+    val tint = if (no) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(Icons.Rounded.Check, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+        Icon(if (no) Icons.Rounded.Close else Icons.Rounded.Check, null, Modifier.size(18.dp), tint = tint)
         Spacer(Modifier.width(6.dp))
-        Text(text, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+        Text(text, style = MaterialTheme.typography.labelLarge, color = tint)
     }
 }
 
@@ -1020,6 +1038,8 @@ private fun Composer(draft: String, onDraft: (String) -> Unit, working: Boolean,
             Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 4.dp, end = 4.dp)) {
                     IconButton(onClick = { attachMenu = true }) { Icon(Icons.Rounded.AttachFile, "Attach a photo or document", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    var camBounds by remember { mutableStateOf(androidx.compose.ui.geometry.Rect.Zero) }
+                    IconButton(onClick = { actions.onCamera(camBounds) }, modifier = Modifier.onGloballyPositioned { camBounds = it.boundsInRoot() }) { Icon(Icons.Rounded.PhotoCamera, "Take a photo", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
                     Box(Modifier.weight(1f).padding(vertical = 16.dp)) {
                         if (draft.isEmpty()) Text("Ask for anything", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         BasicTextField(draft, onDraft, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),

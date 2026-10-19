@@ -143,7 +143,7 @@ fun OnboardingScreen(actions: OnboardingActions, start: OnbStep = OnbStep.HELLO,
 @Composable
 private fun StepPage(eyebrow: String, title: String, line: String?, bottom: @Composable ColumnScope.() -> Unit, content: @Composable ColumnScope.() -> Unit) {
     Column(Modifier.fillMaxSize()) {
-        Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
+        Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = com.past9.phoneaos.ui.sidePad(24.dp, com.past9.phoneaos.ui.Readable.FORM))) {
             Spacer(Modifier.height(4.dp))
             Text(eyebrow.uppercase(), style = Eyebrow, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(10.dp))
@@ -153,7 +153,7 @@ private fun StepPage(eyebrow: String, title: String, line: String?, bottom: @Com
             content()
             Spacer(Modifier.height(24.dp))
         }
-        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 24.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp), content = bottom)
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = com.past9.phoneaos.ui.sidePad(24.dp, com.past9.phoneaos.ui.Readable.FORM), vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp), content = bottom)
     }
 }
 
@@ -429,10 +429,10 @@ val keySteps = mapOf(
 )
 
 @Composable
-fun KeyStep(provider: Provider, onProvider: (Provider) -> Unit, actions: OnboardingActions, initialBaseUrl: String = "", next: () -> Unit) {
+fun KeyStep(provider: Provider, onProvider: (Provider) -> Unit, actions: OnboardingActions, initialBaseUrl: String = "", initialModel: String = "", next: () -> Unit) {
     var key by remember(provider) { mutableStateOf("") }
     var baseUrl by remember(provider) { mutableStateOf(initialBaseUrl) }
-    var model by remember(provider) { mutableStateOf("") }
+    var model by remember(provider) { mutableStateOf(initialModel) }
     var allowHttp by remember(provider) { mutableStateOf(false) }
     var show by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }

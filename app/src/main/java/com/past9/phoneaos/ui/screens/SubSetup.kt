@@ -28,14 +28,14 @@ import com.past9.phoneaos.ui.theme.LocalExtra
 @Composable
 fun SubSetupScreen(kind: SubKind, signInHelp: String, info: RuntimeInfo, installed: Boolean, log: List<String>, installing: Boolean, onBack: () -> Unit, onInstall: () -> Unit, onSaveToken: (String) -> Unit, onUseKey: () -> Unit,
                    onSignIn: () -> Unit = {}, signingIn: Boolean = false, signInError: String? = null, needsCode: Boolean = false, onCode: (String) -> Unit = {},
-                   verifying: Boolean = false, onDone: () -> Unit = {}, modelLabel: String = "", onModel: () -> Unit = {}) {
+                   verifying: Boolean = false, onDone: () -> Unit = {}, modelLabel: String = "", onModel: () -> Unit = {}, onSignOut: () -> Unit = {}) {
     val cs = MaterialTheme.colorScheme
     var showToken by remember { mutableStateOf(false) }
     var showLog by remember { mutableStateOf(false) }
     // Install by itself the moment the screen opens: there is nothing for the user to decide.
     LaunchedEffect(info.available, installed) { if (info.available && !installed && !installing) onInstall() }
     SubScreen("${kind.label} ${kind.plan}", null, onBack) { pad ->
-        Column(Modifier.padding(pad).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 48.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Column(Modifier.padding(pad).verticalScroll(rememberScrollState()).padding(horizontal = com.past9.phoneaos.ui.sidePad(16.dp, com.past9.phoneaos.ui.Readable.FORM)).padding(bottom = 48.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             if (!info.available) {
                 AppCard(container = cs.tertiaryContainer) {
                     Text("This build doesn't include ${kind.label} yet. Use an API key for now; nothing is lost when you switch.", color = cs.onTertiaryContainer)
@@ -74,6 +74,7 @@ fun SubSetupScreen(kind: SubKind, signInHelp: String, info: RuntimeInfo, install
                     }
                     Spacer(Modifier.height(14.dp))
                     Button(onClick = onDone, modifier = Modifier.fillMaxWidth().height(52.dp), shapes = ButtonDefaults.shapes()) { Text("Start chatting") }
+                    TextButton(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) { Text("Sign out to use another account") }
                 }
                 // 3a. Checking the code
                 verifying -> AppCard {

@@ -42,6 +42,7 @@ fun whenLabel(t: TriggerRow): String = when (t.kind) {
     "watch" -> (t.spec.toIntOrNull() ?: 1440).let { m -> "Checks " + when { m >= 1440 && m % 1440 == 0 -> if (m == 1440) "daily" else "every ${m / 1440} days"; m % 60 == 0 -> "every ${m / 60} h"; else -> "every $m min" } + ", wakes your agent only when it fires" }
     "interval" -> (t.spec.toIntOrNull() ?: 60).let { if (it % 60 == 0) "Every ${it / 60} h" else "Every $it min" }
     "email" -> "When a new email matches: ${t.spec}"
+    "wake" -> t.spec.toLongOrNull()?.let { "Once, " + dueLabel(it) + ", only if there's something to act on" } ?: "Once"
     "notification" -> t.spec.split("|").let { "When ${it[0]} notifies" + (it.getOrNull(1)?.takeIf { w -> w.isNotBlank() }?.let { w -> " about \"$w\"" } ?: "") }
     else -> t.kind
 }
@@ -65,7 +66,7 @@ fun RoutinesScreen(routines: List<TriggerRow>, actions: RoutineActions, now: Lon
     SubScreen("Routines", if (running.isEmpty()) "Things your agent does on its own" else "${running.size} running on their own", actions.onBack,
         fab = { ExtendedFloatingActionButton(onClick = { editing = TriggerRow(name = "", kind = "daily", spec = "07:00", prompt = "") }, icon = { Icon(Icons.Rounded.Add, null) }, text = { Text("New routine") }, modifier = Modifier.padding(bottom = (bottomPadding - 40.dp).coerceAtLeast(0.dp))) }) { pad ->
         if (routines.isEmpty()) { Box(Modifier.padding(pad)) { EmptyState("No routines yet", "Say \"every morning at 7, brief me on my day\" or \"when my bank emails, tell me what changed\". Or add one here.", shape = MaterialShapes.Sunny) }; return@SubScreen }
-        LazyColumn(Modifier.padding(pad), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = bottomPadding + 72.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        LazyColumn(Modifier.padding(pad), contentPadding = PaddingValues(start = com.past9.phoneaos.ui.sidePad(16.dp), end = com.past9.phoneaos.ui.sidePad(16.dp), top = 4.dp, bottom = bottomPadding + 72.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             next?.let { (r, ms) -> item(key = "next") { NextUp(r, ms, zNow, { actions.onRunNow(r) }) { editing = r } } }
             val groups = listOf(
                 Triple("On a clock", "Runs at the times you set", routines.filter { it.enabled && it.kind in clock && it.id != next?.first?.id }),
