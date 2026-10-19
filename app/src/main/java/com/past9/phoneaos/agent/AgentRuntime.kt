@@ -1682,7 +1682,7 @@ class AgentRuntime(
     }
 
     // anything still marked working was cut off. Pick it up again.
-    init { scope.launch { guarded("resume helpers") { resumeCutOffHelpers(atStart = true) } } }
+    init { ensureMainChat(); scope.launch { guarded("resume helpers") { resumeCutOffHelpers(atStart = true) } } }
 
     companion object {
         /** How many times a cut-off helper is picked up again before it is called failed. */
