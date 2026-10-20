@@ -99,6 +99,8 @@ data class ChatActions(
     val onReport: (String) -> Unit = {},
     /** Open the thread list (multi-chat). Null hides the button. */
     val onThreads: (() -> Unit)? = null,
+    /** Start a fresh chat. Null hides the button. */
+    val onNewChat: (() -> Unit)? = null,
     /** Unread messages waiting in other chats, for the thread-list badge. */
     val threadBadges: Int = 0,
 )
@@ -355,11 +357,14 @@ private fun ChatTopBar(chatTitle: String, agentName: String, status: AgentStatus
                     IconButton(onClick = actions.onThreads) { Icon(Icons.Rounded.Forum, "Chats") }
                 }
             }
+            if (actions.onNewChat != null) {
+                IconButton(onClick = actions.onNewChat) { Icon(Icons.Rounded.AddComment, "New chat") }
+            }
             Row(Modifier.weight(1f).clip(MaterialTheme.shapes.medium).clickable(onClick = actions.onProfile).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             AgentAvatar(working = status.working, needsYou = needsYou, size = 36.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(chatTitle.ifBlank { agentName }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(chatTitle.ifBlank { agentName }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 6.dp))
                 val line = when {
                     needsYou -> "Waiting for you"
                     status.working -> status.label + if (status.helpers > 0) " · ${status.helpers} helper${if (status.helpers > 1) "s" else ""}" else ""
@@ -373,7 +378,7 @@ private fun ChatTopBar(chatTitle: String, agentName: String, status: AgentStatus
             }
             if (modelLabel.isNotBlank()) Surface(onClick = actions.onModel, shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.padding(end = 6.dp)) {
                 Row(Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(modelLabel, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 110.dp))
+                    Text(modelLabel, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 58.dp))
                     Icon(Icons.Rounded.ArrowDropDown, "Switch model", Modifier.size(20.dp))
                 }
             }

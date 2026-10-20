@@ -54,7 +54,8 @@ fun ThreadsSheet(
                 Row(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Rounded.Add, null, tint = cs.onPrimaryContainer)
                     Spacer(Modifier.width(12.dp))
-                    Text("New chat", style = MaterialTheme.typography.bodyLarge, color = cs.onPrimaryContainer)
+                    Text("Start a new chat", style = MaterialTheme.typography.bodyLarge, color = cs.onPrimaryContainer, modifier = Modifier.weight(1f))
+                    Text("empty", style = MaterialTheme.typography.labelSmall, color = cs.onPrimaryContainer.copy(alpha = 0.7f))
                 }
             }
             Spacer(Modifier.height(8.dp))

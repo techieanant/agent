@@ -387,6 +387,7 @@ class MainActivity : ComponentActivity() {
                         onRead = { id -> if (id > g.settings.chatRead(activeChat)) g.settings.setChatRead(activeChat, id) },
                         actions = ChatActions(
                             onThreads = { threadsOpen = true },
+                            onNewChat = { scope.launch { g.runtime.newChat() } },
                             threadBadges = unreadByChat.filterKeys { it != activeChat }.values.sum(),
                             onCard = { openCard = it },
                             onAct = { g.stopSpeaking(); com.past9.phoneaos.triggers.Overnight.dismissMorning(this@MainActivity); g.runtime.sendQuiet(it) },
