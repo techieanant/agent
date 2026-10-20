@@ -39,6 +39,8 @@ data class SettingsActions(
     val voice: VoiceActions = VoiceActions(),
     val onDeleteRuntime: () -> Unit = {},
     val onClearChat: () -> Unit = {},
+    /** Open the chat list (multi-chat). */
+    val onChats: () -> Unit = {},
     val onResetAll: () -> Unit = {},
     val onBattery: () -> Unit = {},
 )
@@ -101,6 +103,7 @@ fun SettingsScreen(s: AgentSettings, runtime: RuntimeInfo, version: String, acti
             }
             SectionHeader("Your data", "It all lives on this phone", Modifier.padding(start = 4.dp, top = 12.dp))
             AppCard(padding = PaddingValues(vertical = 4.dp)) {
+                Line(Icons.Rounded.Forum, "Chats", "Your separate conversations. Open one from the chat bar.") { actions.onChats() }
                 Line(Icons.Rounded.ChatBubbleOutline, "Clear the conversation", "Memory, tasks and routines stay") { actions.onClearChat() }
                 Line(Icons.Rounded.RestartAlt, "Reset everything", "Deletes keys, memory, tasks and routines", danger = true) { confirmReset = true }
             }

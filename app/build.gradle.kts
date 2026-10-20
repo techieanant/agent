@@ -18,6 +18,8 @@ android {
     targetSdk = 36
     versionCode = 88
     versionName = "0.12.12"
+    // A local build says so, so a sideloaded APK is never mistaken for the release one.
+    if (project.hasProperty("localBuild")) versionName = "0.12.12-local"
     // Android never lets an installed app rename itself or change the icon Samsung shows on
     // notifications, so a personal build bakes the owner's agent in: -PagentName=Iris -PagentIcon=ic_app_heart_red
     resValue("string", "app_name", (project.findProperty("agentName") as String?) ?: "Agent")
