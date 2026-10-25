@@ -9,3 +9,6 @@ app/src/main/assets/runtime/cacert.pem
 
 # macOS
 .DS_Store
+
+# REA + analysis scratch
+.workspace/
