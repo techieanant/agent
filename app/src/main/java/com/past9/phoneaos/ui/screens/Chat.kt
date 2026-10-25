@@ -51,7 +51,6 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
@@ -357,35 +356,41 @@ private fun ChatTopBar(chatTitle: String, agentName: String, status: AgentStatus
                     IconButton(onClick = actions.onThreads) { Icon(Icons.Rounded.Forum, "Chats") }
                 }
             }
-            if (actions.onNewChat != null) {
-                IconButton(onClick = actions.onNewChat) { Icon(Icons.Rounded.AddComment, "New chat") }
-            }
             Row(Modifier.weight(1f).clip(MaterialTheme.shapes.medium).clickable(onClick = actions.onProfile).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            AgentAvatar(working = status.working, needsYou = needsYou, size = 36.dp)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(chatTitle.ifBlank { agentName }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 6.dp))
-                val line = when {
-                    needsYou -> "Waiting for you"
-                    status.working -> status.label + if (status.helpers > 0) " · ${status.helpers} helper${if (status.helpers > 1) "s" else ""}" else ""
-                    status.helpers > 0 -> "${status.helpers} helper${if (status.helpers > 1) "s" else ""} working · you can keep talking"
-                    else -> "Ready"
-                }
-                AnimatedContent(line, transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(150)) }, label = "status") {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = if (needsYou) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
+                AgentAvatar(working = status.working, needsYou = needsYou, size = 36.dp)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(chatTitle.ifBlank { agentName }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 6.dp))
+                    val line = when {
+                        needsYou -> "Waiting for you"
+                        status.working -> status.label + if (status.helpers > 0) " · ${status.helpers} helper${if (status.helpers > 1) "s" else ""}" else ""
+                        status.helpers > 0 -> "${status.helpers} helper${if (status.helpers > 1) "s" else ""} working · you can keep talking"
+                        else -> "Ready"
+                    }
+                    AnimatedContent(line, transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(150)) }, label = "status") {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = if (needsYou) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
-            }
-            if (modelLabel.isNotBlank()) Surface(onClick = actions.onModel, shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.padding(end = 6.dp)) {
-                Row(Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(modelLabel, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 58.dp))
+            if (modelLabel.isNotBlank()) Surface(onClick = actions.onModel, shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.padding(end = 2.dp)) {
+                Row(Modifier.padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(modelLabel, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 52.dp))
                     Icon(Icons.Rounded.ArrowDropDown, "Switch model", Modifier.size(20.dp))
                 }
             }
-            if (actions.onStopSpeaking != null) FilledTonalIconButton(onClick = actions.onStopSpeaking) { Icon(Icons.Rounded.VolumeOff, "Stop reading aloud") }
-            if (actions.onCall != null) IconButton(onClick = actions.onCall) { Icon(Icons.Rounded.Call, "Call your agent") }
             AnimatedVisibility(browserLive, enter = scaleIn(spring(0.6f, 800f)) + fadeIn(), exit = scaleOut() + fadeOut()) {
                 FilledTonalIconButton(onClick = actions.onBrowser) { Icon(Icons.Rounded.Language, "Watch the agent's browser") }
+            }
+            // Call and stop-reading hide in the overflow: the bar stays one row on narrow phones.
+            if (actions.onStopSpeaking != null || actions.onCall != null) {
+                var more by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { more = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }
+                    DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
+                        if (actions.onStopSpeaking != null) DropdownMenuItem(text = { Text("Stop reading aloud") }, leadingIcon = { Icon(Icons.Rounded.VolumeOff, null) }, onClick = { more = false; actions.onStopSpeaking?.invoke() })
+                        if (actions.onCall != null) DropdownMenuItem(text = { Text("Call your agent") }, leadingIcon = { Icon(Icons.Rounded.Call, null) }, onClick = { more = false; actions.onCall?.invoke() })
+                    }
+                }
             }
         }
     }

@@ -40,9 +40,9 @@ class BrowserService : Service() {
         idle = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
             while (true) {
                 kotlinx.coroutines.delay(30_000)
-                val st = com.past9.phoneaos.App.graph(this@BrowserService).runtime.status.value
+                val rt = com.past9.phoneaos.App.graph(this@BrowserService).runtime
                 val quiet = engines.values.none { it.attached || System.currentTimeMillis() - it.lastUsed < IDLE_MS }
-                if (quiet && !st.working && st.helpers == 0) { stopSelf(); break }
+                if (quiet && !rt.anyWorking() && rt.status.value.helpers == 0) { stopSelf(); break }
             }
         }
     }

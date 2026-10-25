@@ -235,8 +235,8 @@ class SettingsStore(context: Context) {
     fun setSecret(key: String, value: String?) { secrets.edit().apply { if (value.isNullOrEmpty()) remove("s_$key") else putString("s_$key", value) }.apply() }
 
     /** The chat thread the user is looking at ("main" for the original chat). */
-    fun activeChat(): String = prefs.getString("active_chat", null)?.takeIf { it.isNotBlank() } ?: "main"
-    fun setActiveChat(id: String) = edit { putString("active_chat", id.ifBlank { "main" }) }
+    fun activeChat(): String = _state.value.activeChat
+    fun setActiveChat(id: String) { val v = id.ifBlank { "main" }; prefs.edit().putString("active_chat", v).apply(); _state.value = _state.value.copy(activeChat = v) }
     /** Per-chat read mark (highest seen chat_items id), for unread badges. */
     fun chatRead(chat: String): Long = prefs.getString("x_read_$chat", null)?.toLongOrNull() ?: 0L
     fun setChatRead(chat: String, id: Long) { prefs.edit().putString("x_read_$chat", id.toString()).apply() }

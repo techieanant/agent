@@ -380,7 +380,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     var threadsOpen by remember { mutableStateOf(false) }
-                    ChatScreen(chatItems, status, settings.agentName, settings.userName, browserLive, draft, { draft = it },
+                    ChatScreen(chatItems, g.runtime.statusFor(activeChat).collectAsStateWithLifecycle().value, settings.agentName, settings.userName, browserLive, draft, { draft = it },
                         listening = dictating,
                         chatTitle = activeThread?.title.orEmpty(),
                         readMark = { g.settings.chatRead(activeChat).takeIf { it > 0 } ?: Long.MAX_VALUE },

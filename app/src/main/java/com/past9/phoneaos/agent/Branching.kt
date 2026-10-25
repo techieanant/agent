@@ -48,8 +48,8 @@ object HeuristicPolicy : BranchPolicy {
     }
 }
 
-/** One line of work in the chat: the main agent, or a branch forked from it. */
-class Line(val id: String, val seq: Long) {
+/** One line of work in the chat: the main agent, or a branch forked from it. Each line belongs to one chat. */
+class Line(val id: String, val seq: Long, var chat: String = "main") {
     val budget = AgentRuntime.StepBudget()
     /** Every tool call in a turn on this line counts here: the main agent's hard ceiling, including memory and task calls. */
     val calls = AgentRuntime.StepBudget(max = 10)

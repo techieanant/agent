@@ -170,7 +170,7 @@ class CallController(private val context: Context, private val db: AppDb, privat
                 }
                 "agent_status" -> scope.launch {
                     val lastAgent = db.chat().all().first().lastOrNull { it.chatId == settings.activeChat() && it.kind == "agent" }?.text.orEmpty()
-                    val stNow = runtime.status.value
+                    val stNow = runtime.statusFor(settings.activeChat()).value
                     live?.sendToolResult(e.id, e.name, JSONObject().put("working", stNow.working).put("doing", stNow.label).put("last_message", lastAgent.take(800)))
                 }
                 else -> live?.sendToolResult(e.id, e.name, JSONObject().put("error", "unknown tool"))
