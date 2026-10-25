@@ -25,7 +25,7 @@ import org.robolectric.annotation.Config
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /** A scripted model: each call pops the next reply; it records what it was sent. */
-class ScriptedProvider(vararg replies: Msg) : LlmProvider {
+open class ScriptedProvider(vararg replies: Msg) : LlmProvider {
     override val name = "scripted"
     val queue = ConcurrentLinkedQueue(replies.toList())
     val seen = mutableListOf<Pair<String, List<Msg>>>()
@@ -36,6 +36,9 @@ class ScriptedProvider(vararg replies: Msg) : LlmProvider {
     val helperTools = mutableListOf<List<String>>()
     val helperModels = java.util.Collections.synchronizedList(mutableListOf<String>())
     override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
+        // Thread-title runs are background noise: answer inline without recording or consuming the script,
+        // so existing turn-order assertions stay exactly as they were.
+        if (system == AgentRuntime.TITLE_SYSTEM) return Completion(say("Test Title"), "end_turn")
         synchronized(seen) { seen += system to messages.toList() }
         if (system.contains("You are a HELPER")) {
             synchronized(helperTools) { helperTools += tools.map { it.name } }

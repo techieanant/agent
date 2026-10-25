@@ -47,24 +47,70 @@ class MultiChatIndependenceTest {
         runCatching { settings.setActiveChat("main") }
     }
 
+    private suspend fun agentsIn(chat: String) = db.chat().all().first().filter { it.chatId == chat && it.kind == "agent" }
+
+    /** Replays scripted replies for chat turns, but answers thread-title runs inline so titles never eat the script. */
+    private class TitledProvider(val titleReply: String, vararg replies: Msg) : ScriptedProvider(*replies) {
+        val titlesSeen = mutableListOf<String>()
+        override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
+            if (system == AgentRuntime.TITLE_SYSTEM) {
+                titlesSeen.add(messages.lastOrNull()?.text.orEmpty())
+                return Completion(say(titleReply), "end_turn")
+            }
+            return super.complete(system, messages, tools, model, maxTokens)
+        }
+    }
     private fun runtime(p: ScriptedProvider) = AgentRuntime(ApplicationProvider.getApplicationContext(), db, settings, CoroutineScope(SupervisorJob() + Dispatchers.IO), phone, { p })
+
+    @Test fun freshChatGetsAnLlmTitleAfterFirstMessage() = runBlocking {
+        val p = TitledProvider("Flight options", say("On it, checking."))
+        val rt = runtime(p)
+        val other = rt.newChat("New chat")
+        rt.send("find me cheap flights to durban")
+        // Snippet first (or the title if the background run already won the race), then the LLM title.
+        until { db.chats().get(other)?.title?.let { it.startsWith("find me cheap") || it == "Flight options" } == true }
+        withTimeout(15_000) { while (db.chats().get(other)?.title != "Flight options") delay(20) }
+        assertEquals("Flight options", db.chats().get(other)?.title)
+        // The title run saw the first message and used the main model.
+        assertTrue(p.titlesSeen.any { it.contains("find me cheap flights to durban") })
+        withTimeout(15_000) { rt.awaitIdle() }
+    }
+
+    @Test fun userRenameWinsOverPendingLlmTitle() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val p = object : LlmProvider {
+            override val name = "gated"
+            override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
+                // Title run (identified by its system prompt): hold it open so the user renames first.
+                if (system == AgentRuntime.TITLE_SYSTEM) { gate.await(); return Completion(say("Late Title"), "end_turn") }
+                return Completion(say("ok"), "end_turn")
+            }
+        }
+        val rt = AgentRuntime(ApplicationProvider.getApplicationContext(), db, settings, CoroutineScope(SupervisorJob() + Dispatchers.IO), phone, { p })
+        val other = rt.newChat("New chat")
+        rt.send("hello there")
+        until { db.chats().get(other)?.title?.startsWith("hello there") == true }
+        assertTrue(rt.renameChat(other, "My Name"))
+        gate.complete(Unit)
+        withTimeout(15_000) { rt.awaitIdle() }
+        // The user's rename stands; the late LLM title does not clobber it.
+        assertEquals("My Name", db.chats().get(other)?.title)
+    }
 
     private suspend fun until(ms: Long = 8_000, cond: suspend () -> Boolean) {
         withTimeout(ms) { while (!cond()) delay(15) }
     }
 
-    private suspend fun agentsIn(chat: String) = db.chat().all().first().filter { it.chatId == chat && it.kind == "agent" }
-
     @Test fun replyLandsInTheChatThatAskedEvenAfterSwitching() = runBlocking {
         // Serial scripted turns: first turn waits on a gate held by the test, second answers at once.
         val gate = CompletableDeferred<Unit>()
-        var calls = 0
         val p = object : LlmProvider {
             override val name = "gated"
             override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
                 val text = messages.lastOrNull()?.blocks?.filterIsInstance<Block.Text>()?.joinToString("") { it.text }.orEmpty()
-                calls++
-                if (calls == 1 && text.contains("slow job")) {
+                if (system == AgentRuntime.TITLE_SYSTEM) return Completion(say("Side topic"), "end_turn")
+                // Gate on the text, not the call count: background title runs must not steal the gate.
+                if (text.contains("slow job")) {
                     gate.await()
                     return Completion(say("slow done"), "end_turn")
                 }
@@ -91,21 +137,21 @@ class MultiChatIndependenceTest {
     }
 
     @Test fun messageInIdleChatRunsThereInsteadOfForking() = runBlocking {
-        var calls = 0
         val gate = CompletableDeferred<Unit>()
-        val p = object : LlmProvider {
+        val inner = object : LlmProvider {
             override val name = "gated"
             override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
                 val text = messages.lastOrNull()?.blocks?.filterIsInstance<Block.Text>()?.joinToString("") { it.text }.orEmpty()
-                calls++
-                if (calls == 1 && text.contains("slow job")) {
+                if (system == AgentRuntime.TITLE_SYSTEM) return Completion(say("Side topic"), "end_turn")
+                // Gate on the text, not the call count: background title runs must not steal the gate.
+                if (text.contains("slow job")) {
                     gate.await()
                     return Completion(say("slow done"), "end_turn")
                 }
                 return Completion(say("quick done"), "end_turn")
             }
         }
-        val rt = AgentRuntime(ApplicationProvider.getApplicationContext(), db, settings, CoroutineScope(SupervisorJob() + Dispatchers.IO), phone, { p })
+        val rt = AgentRuntime(ApplicationProvider.getApplicationContext(), db, settings, CoroutineScope(SupervisorJob() + Dispatchers.IO), phone, { inner })
         rt.send("slow job please")
         until { rt.statusFor("main").value.working }
         // Ask something in the fresh chat while "main" still works: it runs there, no branch.
@@ -120,7 +166,7 @@ class MultiChatIndependenceTest {
     }
 
     @Test fun typedAnswerOnlyAnswersItsOwnChatsQuestion() = runBlocking {
-        val p = ScriptedProvider(
+        val p = TitledProvider("Side topic",
             call("ask_user", JSONObject().put("question", "Which color?").put("options", JSONArray(listOf("Red", "Blue")))),
             say("Noted."),
             say("Hey there."),
@@ -130,7 +176,6 @@ class MultiChatIndependenceTest {
         until { db.chat().all().first().any { it.kind == "question" } }
         val q = db.chat().all().first().first { it.kind == "question" }
         assertEquals("main", q.chatId)
-        // Typing in another chat is its own message, not an answer to "main"'s card.
         // The main agent is one agent: Side's turn queues behind the open question, then runs in Side.
         val other = rt.newChat("Side")
         rt.send("hello over here")

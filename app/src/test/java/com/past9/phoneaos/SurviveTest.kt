@@ -171,6 +171,7 @@ class SurviveTest {
             override val name = "t"
             val main = java.util.concurrent.ConcurrentLinkedQueue(listOf(delegate("bomb job", "fine job"), say("done")))
             override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
+                if (system == AgentRuntime.TITLE_SYSTEM) return Completion(say("Test Title"), "end_turn")
                 if (system.contains("You are a HELPER")) {
                     delay(100)
                     if (messages.first().text.contains("bomb")) throw StackOverflowError("deep")

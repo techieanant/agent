@@ -66,6 +66,8 @@ class SubscriptionPathTest {
         rt.subscription = object : SubscriptionEngine {
             override val ready = true
             override fun turn(prompt: String, system: String, resume: String?, mcpUrl: String, mcpToken: String, images: List<String>, model: String?, role: String) = flow {
+                // Thread-title runs use their own harness call and never touch the recorded session flow.
+                if (system == AgentRuntime.TITLE_SYSTEM) return@flow
                 assertEquals("main", role)
                 seen += resume
                 assertTrue(mcpUrl.startsWith("http://127.0.0.1:")); assertEquals(settings.localToken(), mcpToken)
@@ -92,6 +94,8 @@ class SubscriptionPathTest {
         rt.subscription = object : SubscriptionEngine {
             override val ready = true
             override fun turn(prompt: String, system: String, resume: String?, mcpUrl: String, mcpToken: String, images: List<String>, model: String?, role: String) = flow {
+                // Thread-title runs use their own harness call and never touch the recorded session flow.
+                if (system == AgentRuntime.TITLE_SYSTEM) return@flow
                 calls += Triple(role, mcpUrl, model)
                 when {
                     role == "helper" -> {

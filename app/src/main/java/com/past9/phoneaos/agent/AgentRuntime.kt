@@ -654,9 +654,11 @@ class AgentRuntime(
         else db.chat().insert(ChatItem(kind = "user", text = clean, chatId = chat, meta = JSONObject().put("images", org.json.JSONArray(images.filter { !it.contains("/pdf-") }))
             .put("files", org.json.JSONArray(files)).put("voiceReply", voiceReply).toString()))
         touchChat(chat)
-        // A fresh chat names itself from its first message (Muse's thread titles from snippets).
+        // A fresh chat names itself from its first message: a LLM-written few-word title,
+        // with the raw snippet as the instant fallback (replaced when the title lands).
         if (fromCall == null && !quiet) db.chats().get(chat)?.takeIf { it.title == "Main chat" || it.title == "New chat" }?.let {
             db.chats().update(it.copy(title = clean.take(60)))
+            titleChat(chat, clean)
         }
         val forModel = if (voiceReply) "$clean\n\n(The user is on the move: answer with a voice_note, then at most one short line of text. Don't repeat the voice note as text.)"
             else if (quiet) "[The user tapped a button on a card you drew. They did not type this and it is not in the chat as their message, so don't quote it back as something they said; just act on it.]\n$clean"
@@ -783,7 +785,7 @@ class AgentRuntime(
             setStatus(c) { it.copy(working = true, label = "Thinking") }; phone.workStarted()
             try {
                 val sub = subscription?.takeIf { settings.state.value.mode == PowerMode.SUBSCRIPTION && it.ready }
-                if (sub != null) branchSub(b, sub, text, images, first, parentSession) else branchApi(b, text, images, first, base, c)
+                if (sub != null) branchSub(b, sub, text, images, first, parentSession, c) else branchApi(b, text, images, first, base, c)
             } catch (e: CancellationException) {
                 b.outcome = if (line.supersededBy != null) "superseded" else "stopped"
                 if (line.supersededBy == null) sayIn(c, "notice", "Stopped.", JSONObject().put("branch", b.item))
@@ -820,8 +822,7 @@ class AgentRuntime(
             incoming = { generateSequence { b.line.notes.poll() }.toList() })
     }
 
-    private suspend fun branchSub(b: Branch, engine: SubscriptionEngine, text: String, images: List<String>, first: Boolean, parentSession: String?) {
-        val chat = branchChat(b)
+    private suspend fun branchSub(b: Branch, engine: SubscriptionEngine, text: String, images: List<String>, first: Boolean, parentSession: String?, chat: String) {
         val sys = systemPrompt(b.userText)
         val url = mcp.url + "/b/${b.item}"
         val canFork = engine.canFork && parentSession != null
@@ -1628,6 +1629,43 @@ class AgentRuntime(
         mirrorStatus(id)
         return id
     }
+    /**
+     * Name a fresh chat with a few-word LLM title (Muse names threads from their content).
+     * Runs in the background: the raw snippet shows at once and is replaced when the title lands.
+     * Only renames while the user hasn't renamed it themselves and nothing else has.
+     */
+    private fun titleChat(chat: String, firstMessage: String) {
+        val fallback = firstMessage.take(60)
+        scope.launch {
+            val title = runCatching {
+                val prompt = "Give this chat a very short title, 2 to 5 words, plain words only, no quotes, no punctuation at the end, no emoji. Just name its topic.\n\nUser: ${firstMessage.take(500)}"
+                if (settings.state.value.mode == PowerMode.SUBSCRIPTION && subscription?.ready == true)
+                    titleViaSubscription(prompt)
+                else
+                    providerFactory(settings)?.let { p ->
+                        AgentLoop(p, settings.state.value.model, emptyList(), maxSteps = 3)
+                            .run(TITLE_SYSTEM, mutableListOf(Msg.user(prompt)), QuietContext())
+                    }
+            }.getOrNull()?.trim()?.trim('"', '\'', '.', '!', '?')?.take(60).orEmpty()
+            val clean = title.lines().firstOrNull()?.trim().orEmpty()
+                .replace(Regex("^[\"'\\-–—*]+|[\"'\\-–—*.!?]+$"), "").trim().take(60)
+            if (clean.length < 2) return@launch
+            db.chats().get(chat)?.takeIf { it.title == fallback || it.title == "Main chat" || it.title == "New chat" }?.let {
+                db.chats().update(it.copy(title = clean, updatedAt = System.currentTimeMillis()))
+            }
+        }
+    }
+
+    /** One tiny harness turn that only returns text (a thread title), or null. */
+    private suspend fun titleViaSubscription(prompt: String): String? {
+        val engine = subscription?.takeIf { settings.state.value.mode == PowerMode.SUBSCRIPTION && it.ready } ?: return null
+        var out: String? = null
+        // A null resume starts a throwaway session: the user's ongoing chat sessions are untouched.
+        engine.turn(prompt, TITLE_SYSTEM, null, mcp.url, settings.localToken(), emptyList(), role = "main").collect { e ->
+            if (e.optString("type") == "text") out = (out.orEmpty() + e.optString("text"))
+        }
+        return out?.takeIf { it.isNotBlank() }
+    }
 
     /** Switch the visible chat. No-op when unknown. */
     suspend fun switchChat(id: String): Boolean {
@@ -1805,6 +1843,8 @@ class AgentRuntime(
     init { ensureMainChat(); scope.launch { guarded("resume helpers") { resumeCutOffHelpers(atStart = true) } } }
 
     companion object {
+        /** System prompt for the tiny thread-title run: the model answers with only the title. */
+        const val TITLE_SYSTEM = "Reply with only the chat title the user was asked for, nothing else."
         /** How many times a cut-off helper is picked up again before it is called failed. */
         const val MAX_RESUMES = 2
         /** Marks a redirect as "sent back" (vs. "answered for the user") on its way to the helper's tool result. */

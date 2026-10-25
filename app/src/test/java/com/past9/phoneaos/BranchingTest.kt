@@ -33,6 +33,8 @@ class BranchProvider : LlmProvider {
     val calls = java.util.Collections.synchronizedList(mutableListOf<Pair<String, List<Msg>>>())
     var handler: suspend (system: String, msgs: List<Msg>) -> Msg = { _, _ -> say("ok") }
     override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
+        // Thread-title runs are background noise: answer inline without recording, so turn-order assertions hold.
+        if (system == AgentRuntime.TITLE_SYSTEM) return Completion(say("Test Title"), "end_turn")
         calls += system to messages.toList()
         return Completion(handler(system, messages.toList()), "end_turn")
     }
@@ -305,6 +307,8 @@ class BranchingTest {
         val forkedFrom = java.util.Collections.synchronizedList(mutableListOf<String>())
         val release = CompletableDeferred<Unit>()
         override fun turn(prompt: String, system: String, resume: String?, mcpUrl: String, mcpToken: String, images: List<String>, model: String?, role: String): Flow<JSONObject> = flow {
+            // Thread-title runs answer inline and are never recorded as conversation turns.
+            if (prompt.startsWith("Give this chat")) { emit(JSONObject().put("type", "text").put("text", "Test Title")); emit(JSONObject().put("type", "done").put("ok", true)); return@flow }
             prompts += prompt
             emit(JSONObject().put("type", "session").put("id", resume ?: "s-main"))
             if (prompt.startsWith("slow")) release.await()
