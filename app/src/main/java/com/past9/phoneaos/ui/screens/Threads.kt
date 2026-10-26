@@ -8,9 +8,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.MoreVert
-import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,14 +22,15 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
-/** One row of the thread list: title, snippet, time, unread badge, pin marker. */
+/** One row of the thread list: title, snippet, time, unread badge, pin marker, live work marker. */
 data class ThreadRow(
     val thread: ChatThread,
     val snippet: String = "",
     val unread: Int = 0,
     val active: Boolean = false,
+    val working: Boolean = false,
+    val workingLabel: String = "",
 )
-
 /** Multi-chat thread list (Muse-style threads sheet). New chat on top, archived at the bottom. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -97,6 +96,7 @@ private fun ThreadItem(
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (t.pinned) { Icon(Icons.Rounded.PushPin, null, Modifier.size(14.dp), tint = cs.primary); Spacer(Modifier.width(4.dp)) }
+                    if (r.working && !r.active) { Icon(Icons.Rounded.Sync, "Working in this chat", Modifier.size(14.dp), tint = cs.tertiary); Spacer(Modifier.width(4.dp)) }
                     Text(t.title.ifBlank { "Chat" }, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                     if (r.unread > 0 && !r.active) {
                         Spacer(Modifier.width(8.dp))
@@ -104,6 +104,7 @@ private fun ThreadItem(
                     }
                 }
                 if (r.snippet.isNotBlank()) Text(r.snippet, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (r.working && !r.active && r.workingLabel.isNotBlank()) Text(r.workingLabel, style = MaterialTheme.typography.labelSmall, color = cs.tertiary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(threadTime(t.updatedAt), style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
             }
             Box {

@@ -215,10 +215,10 @@ class RuntimeTest {
         assertTrue(sys.contains("hard limit of 5 action steps"))
         assertTrue(sys.contains("ASSUME YOU ALREADY KNOW"))
         assertFalse(sys.contains("You are a HELPER"))
-        assertTrue(sys.contains("separate chats (threads)"))
+        assertTrue(sys.contains("every chat runs as its own independent agent"))
+        assertTrue(sys.contains("MAIN CHAT AS SUPERVISOR"))
         assertTrue(rt.systemPrompt("x", role = PromptRole.HELPER).contains("You are a HELPER"))
     }
-
     @Test fun approvalInAHelperBlocksUntilTheUserAnswers() = runBlocking {
         // The helper's approval goes to the main agent first; it forwards it (an email in the user's name).
         val p = ScriptedProvider(delegate("Email Lerato: see you at 6 on Friday"), say("Sent a helper."),

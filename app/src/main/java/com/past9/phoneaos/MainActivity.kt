@@ -413,7 +413,8 @@ class MainActivity : ComponentActivity() {
                     if (threadsOpen) com.past9.phoneaos.ui.screens.ThreadsSheet(
                         rows = threads.map { t ->
                             val last = items.lastOrNull { it.chatId == t.id && (it.kind == "user" || it.kind == "agent") }
-                            com.past9.phoneaos.ui.screens.ThreadRow(t, last?.text.orEmpty(), unreadByChat[t.id] ?: 0, t.id == activeChat)
+                            val st = g.runtime.statusFor(t.id).collectAsStateWithLifecycle().value
+                            com.past9.phoneaos.ui.screens.ThreadRow(t, last?.text.orEmpty(), unreadByChat[t.id] ?: 0, t.id == activeChat, st.working, st.label)
                         },
                         onPick = { id -> scope.launch { g.runtime.switchChat(id); threadsOpen = false } },
                         onNew = { scope.launch { g.runtime.newChat(); threadsOpen = false } },
@@ -577,7 +578,7 @@ class MainActivity : ComponentActivity() {
                         onPinHome = { com.past9.phoneaos.system.Identity.pinNamedShortcut(this@MainActivity, settings.agentName, settings.mascot, settings.accent) },
                         onClearChat = { g.runtime.clearConversation() },
                         onChats = { nav.navigate("chat") { launchSingleTop = true } },
-                        onResetAll = { scope.launch { g.runtime.stop(); g.db.clearAllTables(); g.settings.resetAll() } },
+                        onResetAll = { scope.launch { g.runtime.stopAll(); g.db.clearAllTables(); g.settings.resetAll() } },
                         onBattery = { runCatching { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) } },
                     ))
                 }

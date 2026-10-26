@@ -141,32 +141,31 @@ class CallController(private val context: Context, private val db: AppDb, privat
                     runtime.send("Task from our voice call: $task\n\nWhat was said on the call so far:\n${transcript()}", fromCall = task)
                     _state.value = st.copy(delegated = task)
                     // One thing at a time: if the main agent is blocked on a question, this waits in line behind it, so say so.
-                    val waiting = runtime.pendingQuestionId()
+                    val waiting = runtime.visiblePendingQuestionId()
                     live?.sendToolResult(e.id, e.name, if (waiting == null) JSONObject().put("status", "started").put("note", "The main agent is working on it. You'll get an update.")
                         else JSONObject().put("status", "queued").put("note", "Queued: the main agent first needs the user's answer to the question it asked. Get that answered (answer_agent_question), then this runs."))
-                }
-                "answer_agent_question" -> scope.launch {
-                    val id = runtime.pendingQuestionId()
-                    val item = id?.let { db.chat().get(it) }
-                    val answer = e.args.optString("answer").trim(); val extra = e.args.optString("context").trim()
-                    val res = when {
-                        item == null -> JSONObject().put("error", "The main agent isn't waiting on anything right now.")
-                        item.text.startsWith("APPROVAL|") && !Regex("^(no|decline|don't|do not|cancel|stop)", RegexOption.IGNORE_CASE).containsMatchIn(answer) ->
-                            JSONObject().put("error", "This needs the user to hold Approve on the card on the call screen. Declining by voice is fine.")
-                        else -> {
-                            val opts = JSONObject(item.meta).optJSONArray("options")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty()
-                            // Match a spoken answer to an option where it clearly is one; otherwise pass the words on.
-                            val picked = opts.firstOrNull { it.equals(answer, true) } ?: opts.firstOrNull { answer.contains(it, true) || it.contains(answer, true) }
-                            val final = when {
-                                item.text.startsWith("APPROVAL|") -> "Decline"
-                                picked != null && extra.isBlank() -> picked
-                                else -> (picked ?: answer) + if (extra.isNotBlank()) " (from our voice call: $extra)" else ""
+                    val id = runtime.visiblePendingQuestionId()
+                    scope.launch {
+                        val item = id?.let { db.chat().get(it) }
+                        val answer = e.args.optString("answer").trim(); val extra = e.args.optString("context").trim()
+                        val res = when {
+                            item == null -> JSONObject().put("error", "The main agent isn't waiting on anything right now.")
+                            item.text.startsWith("APPROVAL|") && !Regex("^(no|decline|don't|do not|cancel|stop)", RegexOption.IGNORE_CASE).containsMatchIn(answer) ->
+                                JSONObject().put("error", "This needs the user to hold Approve on the card on the call screen. Declining by voice is fine.")
+                            else -> {
+                                val opts = JSONObject(item.meta).optJSONArray("options")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty()
+                                val picked = opts.firstOrNull { it.equals(answer, true) } ?: opts.firstOrNull { answer.contains(it, true) || it.contains(answer, true) }
+                                val final = when {
+                                    item.text.startsWith("APPROVAL|") -> "Decline"
+                                    picked != null && extra.isBlank() -> picked
+                                    else -> (picked ?: answer) + if (extra.isNotBlank()) " (from our voice call: $extra)" else ""
+                                }
+                                runtime.answer(item.id, final)
+                                JSONObject().put("status", "answered").put("answer", final)
                             }
-                            runtime.answer(item.id, final)
-                            JSONObject().put("status", "answered").put("answer", final)
                         }
+                        live?.sendToolResult(e.id, e.name, res)
                     }
-                    live?.sendToolResult(e.id, e.name, res)
                 }
                 "agent_status" -> scope.launch {
                     val lastAgent = db.chat().all().first().lastOrNull { it.chatId == settings.activeChat() && it.kind == "agent" }?.text.orEmpty()

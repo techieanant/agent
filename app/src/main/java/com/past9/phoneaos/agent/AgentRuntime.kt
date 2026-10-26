@@ -114,11 +114,20 @@ class AgentRuntime(
     /** The chat on screen changed: the mirror follows it so Home and notifications read the right chat. */
     private fun mirrorStatus(chat: String) { _status.value = statusFor(chat).value }
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<String>>()
-    /** Questions the MAIN agent is waiting on: typing in the chat answers these (helpers' questions are answered by tapping). */
-    private val mainQuestions = ConcurrentHashMap.newKeySet<Long>()
-    private val turnLock = Mutex()
-    /** Main-agent turns: the user's messages and helper results coming back. */
+    /** Questions the MAIN agent is waiting on, per chat: typing in the chat answers its own open question. */
+    private val mainQuestions = ConcurrentHashMap<String, ConcurrentHashMap.KeySetView<Long, Boolean>>()
+    private fun questionsOf(chat: String) = mainQuestions.getOrPut(chat) { ConcurrentHashMap.newKeySet() }
+    /** One turn lock per chat: chats run their turns in parallel, each chat's own turns stay ordered. */
+    private val turnLocks = ConcurrentHashMap<String, Mutex>()
+    private fun turnLock(chat: String) = turnLocks.getOrPut(chat) { Mutex() }
+    /** Main-agent turns, tracked globally and per chat so stopping one chat never touches another's turns. */
     private val turnJobs = ConcurrentHashMap.newKeySet<Job>()
+    private val chatJobs = ConcurrentHashMap<String, MutableSet<Job>>()
+    private fun trackJob(chat: String, j: Job) {
+        turnJobs += j
+        chatJobs.getOrPut(chat) { ConcurrentHashMap.newKeySet() }.add(j)
+        j.invokeOnCompletion { turnJobs.remove(j); chatJobs[chat]?.remove(j) }
+    }
 
     /** Helpers working right now, by their chat item id. */
     private val helpers = ConcurrentHashMap<Long, HelperRun>()
@@ -278,7 +287,7 @@ class AgentRuntime(
     init {
         // Same for branches: one still marked running was cut off. Keep what it did and fold it back into the main line cleanly.
         // Its own turn (not inside the launch above), so awaitIdle and the merge bookkeeping see it.
-        launchTurn {
+        launchTurn(chat = null, block = {
             val rows = db.chat().all().first().filter { it.kind == "branch" }
             rows.filter { JSONObject(it.meta).optString("state") == "running" }.forEach { r ->
                 db.chat().update(r.copy(meta = JSONObject(r.meta).put("state", "interrupted").put("error", "Interrupted when the app closed.").toString()))
@@ -286,7 +295,7 @@ class AgentRuntime(
             }
             unmerged.set(rows.count { !JSONObject(it.meta).optBoolean("merged") })
             if (unmerged.get() > 0) mergeBranches()
-        }
+        })
     }
 
     /**
@@ -524,7 +533,8 @@ class AgentRuntime(
                     }
                 }
                 appendLine("- ASSUME YOU ALREADY KNOW. Before asking the user anything, search memory (memory_search, then memory_get). Ask (ask_user, with buttons) only when you've checked and truly don't know, or it's a choice only they can make. Needless questions annoy them.")
-                appendLine("- CHATS: the user keeps separate chats (threads), one topic each. You only ever see this chat's history (chat_list shows the others). When the user changes subject, start a fresh chat with chat_new (short title) instead of mixing topics. chat_rename, chat_pin, chat_archive and chat_delete keep the list tidy. The original chat is never deleted.")
+                appendLine("- CHATS: every chat runs as its own independent agent, all of them you, sharing one memory, one to-do list, one set of routines and one set of connected apps. The chat you're answering in right now is the only history you can see (chat_list shows the others). When the user changes subject, start a fresh chat with chat_new (short title) and continue there instead of mixing topics. chat_rename, chat_pin, chat_archive and chat_delete keep the list tidy. The original chat is never deleted.")
+                appendLine("- MAIN CHAT AS SUPERVISOR: the chat called \"Main chat\" is your supervisor seat. From any side chat you can hand coordination back with chat_switch to it; from Main chat you can see every chat's state with chat_list and start follow-ups in side chats with chat_new plus a precise brief, or answer in place. When several chats work at once, keep each outcome in its own chat and only bring to the user what needs them. Approvals (ask_user, request_approval) always surface in the chat that asked, with a notification, no matter which chat is on screen.")
                 appendLine("- Memory is your wiki about the user's life: one page per person, company, place, project or preference, in markdown, linking other pages as [[Name]], always tagged. Whenever you learn something durable (from them or from a helper's result), save or update the page right away (memory_get first to merge). Keep pages accurate and fix wrong ones. This is the most important thing you do.")
                 appendLine("- The user uses you as their to-do list. Things THEY must do or asked to be reminded of go on their list (task_add owner user). The work you hand out lives under goals (goal_create) with a task per step; tick them off as helper results come in, and when stuck mark the step blocked and say what would unblock it. Keep the list true: when a date moves, give the task its new due date (task_update); what no longer applies is removed (task_delete, goal_delete), never left with another status.")
                 appendLine("- Routines: you come up with the ideas (a morning brief, watching a price, chasing a reply) and suggest them. When the user agrees, a helper creates it: delegate with the exact schedule and the instruction the routine should run. routine_list shows what exists. To change one, the helper edits it in place (routine_update) and keeps everything the user didn't ask to change.")
@@ -628,10 +638,9 @@ class AgentRuntime(
             prev?.join()
             // A question card is waiting and the user typed instead of tapping: the typed words ARE the answer,
             // but only when the question is in this chat. Another chat's card is answered by tapping.
-            if (fromCall == null && !quiet && images.isEmpty() && files.isEmpty() && mainQuestions.isNotEmpty()) {
-                val id = mainQuestions.maxOrNull()
-                val sameChat = id != null && runCatching { db.chat().get(id)?.chatId == chat }.getOrDefault(false)
-                if (sameChat && id != null) {
+            if (fromCall == null && !quiet && images.isEmpty() && files.isEmpty() && questionsOf(chat).isNotEmpty()) {
+                val id = questionsOf(chat).maxOrNull()
+                if (id != null) {
                     db.chat().insert(ChatItem(kind = "user", text = clean, chatId = chat))
                     answer(id, clean)
                     return@launch
@@ -666,7 +675,7 @@ class AgentRuntime(
         if (target == null || rel == null) {
             val line = lineFor(chat)
             line.userText = clean
-            launchMain(chat) { turnLock.withLock { runTurn(chat, forModel, images, replyTo = origin) } }
+            launchMain(chat) { turnLock(chat).withLock { runTurn(chat, forModel, images, replyTo = origin) } }
             return
         }
         // "ok thanks": no agent is worth forking for it. The running line just hears it.
@@ -697,17 +706,17 @@ class AgentRuntime(
             if (parent.id.startsWith("b")) branches[parent.id.removePrefix("b").toLongOrNull() ?: -1]?.outcome = "superseded"
             b.adopt = parent.id.startsWith("main:")
         }
-        val j = launchTurn {
+        val j = launchTurn({
             try { runBranchTurn(b, forModel, images, first = true, base = base, parentSession = parentSession, chat = chat) }
             finally { endBranchTurn(b) }
-        }
+        }, chat)
         line.job = j
     }
 
     /** A main-agent turn on the app's scope, tracked so stop() and awaitIdle() can reach it. */
-    private fun launchTurn(block: suspend CoroutineScope.() -> Unit): Job {
+    private fun launchTurn(block: suspend CoroutineScope.() -> Unit, chat: String? = null): Job {
         val j = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY, block = block)
-        turnJobs += j; j.invokeOnCompletion { turnJobs.remove(j) }
+        trackJob(chat ?: "__global__", j)
         j.start(); return j
     }
 
@@ -715,8 +724,8 @@ class AgentRuntime(
     private fun launchMain(chat: String, block: suspend CoroutineScope.() -> Unit): Job {
         val line = lineFor(chat)
         if (mainPending.getOrPut(chat) { java.util.concurrent.atomic.AtomicInteger() }.getAndIncrement() == 0) activeLines[line.id] = line
-        val j = launchTurn(block)
-        j.invokeOnCompletion { if (mainPending[chat]?.decrementAndGet() == 0) activeLines.remove(line.id); if (unmerged.get() > 0) launchTurn { mergeBranches() } }
+        val j = launchTurn(block, chat)
+        j.invokeOnCompletion { if (mainPending[chat]?.decrementAndGet() == 0) activeLines.remove(line.id); if (unmerged.get() > 0) launchTurn({ mergeBranches() }, chat) }
         return j
     }
 
@@ -724,10 +733,10 @@ class AgentRuntime(
     private fun deliverFor(branchId: Long?, note: String, origin: Long?, chat: String? = null) {
         val b = branchId?.let { branches[it] } ?: return deliver(note, origin, chat = chat)
         b.turns.incrementAndGet(); activeLines[b.line.id] = b.line
-        launchTurn {
+        launchTurn({
             try { runBranchTurn(b, note, emptyList(), first = false, chat = branchChat(b)) }
             finally { endBranchTurn(b) }
-        }
+        }, b.line.chat)
     }
 
     /** A result from a job handed to one of the user's machines reaches the main agent like a helper's. */
@@ -739,19 +748,15 @@ class AgentRuntime(
         // while results queue must not move them.
         val here = chat ?: activeChat()
         inbox += Inbound(note, origin, escalation, here)
+        // The new note is drained under its own chat's lock; other chats' notes wait for their own drain.
+        // Chats proceed in parallel and one chat's waiting never blocks another. Order within a chat is preserved.
         launchMain(here) {
-            turnLock.withLock {
+            turnLock(here).withLock {
                 val batch = generateSequence { inbox.poll() }.toList()
                 // The reply quotes the message that asked for this work (the newest, if several landed together).
-                if (batch.isNotEmpty()) {
-                    // A result for another chat runs there (its reply lands in that chat, with an unread badge).
-                    val mine = batch.filter { it.chat == here }
-                    val other = batch.filter { it.chat != here }
-                    if (mine.isNotEmpty()) runTurn(here, mine.joinToString("\n\n") { it.note }, fromUser = false, replyTo = mine.mapNotNull { it.origin }.maxOrNull())
-                    other.groupBy { it.chat }.forEach { (c, notes) ->
-                        runTurnIn(c, notes.joinToString("\n\n") { it.note }, fromUser = false, replyTo = notes.mapNotNull { it.origin }.maxOrNull())
-                    }
-                }
+                val mine = batch.filter { it.chat == here }
+                if (mine.isNotEmpty()) runTurn(here, mine.joinToString("\n\n") { it.note }, fromUser = false, replyTo = mine.mapNotNull { it.origin }.maxOrNull())
+                else batch.forEach { inbox += it }
                 batch.mapNotNull { it.escalation }.forEach { untriaged(it) }
             }
         }
@@ -851,11 +856,11 @@ class AgentRuntime(
         if (b.turns.get() != 0 || helperBranch.values.any { it == b.item }) return
         if (branches.remove(b.item) == null) return
         branchCtx.remove(b.item)
-        launchTurn {
+        launchTurn(chat = b.line.chat, block = {
             db.chat().get(b.item)?.let { row -> db.chat().update(row.copy(meta = JSONObject(row.meta).put("state", b.outcome).apply {
                 b.error?.let { put("error", it) }; b.line.session?.let { put("session", it) }; if (b.adopt) put("adopt", true); put("endedAt", System.currentTimeMillis()) }.toString())) }
             mergeBranches()
-        }
+        })
     }
 
     /**
@@ -863,14 +868,20 @@ class AgentRuntime(
      * labelled block, so the next turn sees everything the branches did and nothing is redone. Waits for that chat's
      * main line to be idle and stops at the first branch still working (so the order never jumps).
      */
-    private suspend fun mergeBranches() = turnLock.withLock {
-        val rows = db.chat().all().first().filter { it.kind == "branch" }.sortedBy { JSONObject(it.meta).optLong("origin") }
+    private suspend fun mergeBranches() {
+        // Merge per chat under that chat's lock: one chat's merge never blocks another chat's turns.
+        val chats = db.chat().all().first().filter { it.kind == "branch" }.map { it.chatId }.toSet()
+        (chats + "main").forEach { c -> launchTurn(block = { turnLock(c).withLock { mergeBranchesIn(c) } }, chat = c).join() }
+    }
+
+    private suspend fun mergeBranchesIn(chat: String) {
+        val rows = db.chat().all().first().filter { it.kind == "branch" && it.chatId == chat }.sortedBy { JSONObject(it.meta).optLong("origin") }
         val sub = settings.state.value.mode == PowerMode.SUBSCRIPTION && subscription?.ready == true
         for (row in rows) {
             val m = JSONObject(row.meta)
             if (m.optBoolean("merged")) continue
             if (m.optString("state") == "running") break
-            // Another chat working is no reason to wait: only this chat's own lines gate its merges.
+            // Only this chat's own lines gate its merges; other chats never block it.
             if (activeLines.values.any { it.chat == row.chatId }) continue
             val state = m.optString("state")
             val delta = db.chat().recentTurns("${row.chatId}/b${row.id}", 500).reversed().mapNotNull { runCatching { Msg.fromJson(JSONObject(it.json)) }.getOrNull() }
@@ -924,12 +935,29 @@ class AgentRuntime(
         }
     }
 
-    /** Stop everything: the main agent's turns and every helper. Every chat goes quiet. */
-    fun stop() {
+    /**
+     * Stop this chat's work: its queued and running turns and branches go quiet, and helpers
+     * it started are stopped. Other chats keep working untouched.
+     */
+    fun stop(chat: String = activeChat()) = scope.launch {
+        chatJobs[chat]?.toList()?.forEach { it.cancel() }
+        helpers.filter { runCatching { db.chat().get(it.key)?.chatId == chat }.getOrDefault(false) }.forEach { it.value.job.cancel() }
+        pending.keys.toList().forEach { id ->
+            if (runCatching { db.chat().get(id)?.chatId == chat }.getOrDefault(false)) pending.remove(id)?.cancel()
+        }
+        val keep = generateSequence { inbox.poll() }.toList().filter { it.chat != chat }
+        keep.forEach { inbox += it }
+        questionsOf(chat).clear()
+        setStatus(chat) { AgentStatus() }
+    }
+
+    /** Stop everything, everywhere: used only for a full reset. */
+    fun stopAll() {
         turnJobs.forEach { it.cancel() }
         helpers.values.forEach { it.job.cancel() }
         inbox.clear()
-        pending.values.forEach { it.cancel() }; pending.clear(); mainQuestions.clear()
+        pending.values.forEach { it.cancel() }; pending.clear()
+        mainQuestions.keys.forEach { mainQuestions[it]?.clear() }
         escalations.values.forEach { it.result.cancel() }; escalations.clear(); redirects.clear()
         chatWork.values.forEach { it.value = AgentStatus(helpers = helpers.size) }
         _status.value = AgentStatus(helpers = helpers.size)
@@ -944,11 +972,16 @@ class AgentRuntime(
     /** The question card the agent is waiting on right now, if any (newest first). */
     fun pendingQuestionId(): Long? = pending.keys.maxOrNull()
 
+    /** The question card the main agent is waiting on in the visible chat, if any. */
+    fun visiblePendingQuestionId(): Long? = questionsOf(activeChat()).maxOrNull()
+
     /** The user tapped an option on a question card (in the app or on a notification). */
     fun answer(itemId: Long, option: String) {
         scope.launch {
-            db.chat().get(itemId)?.let { db.chat().update(it.copy(meta = JSONObject(it.meta).put("answer", option).toString())) }
-            pending.remove(itemId)?.complete(option); mainQuestions.remove(itemId)
+            val item = db.chat().get(itemId)
+            item?.let { db.chat().update(it.copy(meta = JSONObject(it.meta).put("answer", option).toString())) }
+            pending.remove(itemId)?.complete(option)
+            mainQuestions.values.forEach { it.remove(itemId) }
         }
     }
 
@@ -1709,7 +1742,7 @@ class AgentRuntime(
     }
 
     /** Overnight: the model's transcript is folded into the running story, so each day starts clean. The chat the user sees stays. */
-    suspend fun compact() = turnLock.withLock {
+    suspend fun compact() = turnLock(activeChat()).withLock {
         db.chat().clearTurns(activeChat()); settings.setChatSession(activeChat(), null)
     }
 
@@ -1756,7 +1789,7 @@ class AgentRuntime(
             val id = db.chat().insert(ChatItem(kind = "question", text = question, chatId = chat, meta = JSONObject().put("options", org.json.JSONArray(options))
                 .apply { helperItem?.let { put("helper", it).put("by", display) }; why?.let { put("why", it).put("whyBy", agentName()) }; branchItem?.let { put("branch", it) } }.toString()))
             val d = CompletableDeferred<String>(); pending[id] = d
-            if (helperItem == null) mainQuestions += id
+            if (helperItem == null) questionsOf(chat) += id
             val prev = statusFor(chat).value; if (helperItem == null) setStatus(chat) { it.copy(label = "Waiting for you") }
             val isApproval = question.startsWith("APPROVAL|")
             val connect = com.past9.phoneaos.tools.ConnectRequest.parse(question)
@@ -1766,7 +1799,7 @@ class AgentRuntime(
                 why != null -> phone.notify("${agentName()} needs you", "$why\n$question", id, options)
                 else -> phone.notify("Your agent has a question", question, id, options)
             }
-            return try { d.await() } finally { mainQuestions.remove(id); if (helperItem == null) setStatus(chat) { prev.copy(helpers = helpers.size) } }
+            return try { d.await() } finally { questionsOf(chat).remove(id); if (helperItem == null) setStatus(chat) { prev.copy(helpers = helpers.size) } }
         }
         override suspend fun notify(title: String, body: String) = phone.notify(title, body)
     }

@@ -60,10 +60,45 @@ class MultiChatIndependenceTest {
             return super.complete(system, messages, tools, model, maxTokens)
         }
     }
-    private fun runtime(p: ScriptedProvider) = AgentRuntime(ApplicationProvider.getApplicationContext(), db, settings, CoroutineScope(SupervisorJob() + Dispatchers.IO), phone, { p })
+    private fun runtime(p: LlmProvider) = AgentRuntime(ApplicationProvider.getApplicationContext(), db, settings, CoroutineScope(SupervisorJob() + Dispatchers.IO), phone, { p })
+    private fun runtimeFor(p: LlmProvider) = runtime(p)
 
+    /** Two chats whose turns overlap in time run side by side; stopping one never touches the other. */
+    @Test fun chatsRunInParallelAndStopIsPerChat() = runBlocking {
+        val releaseA = CompletableDeferred<Unit>()
+        val releaseB = CompletableDeferred<Unit>()
+        val p = object : LlmProvider {
+            override val name = "gated"
+            override suspend fun complete(system: String, messages: List<Msg>, tools: List<ToolSpec>, model: String, maxTokens: Int): Completion {
+                if (system == AgentRuntime.TITLE_SYSTEM) return Completion(say("Side topic"), "end_turn")
+                val text = messages.lastOrNull()?.blocks?.filterIsInstance<Block.Text>()?.joinToString("") { it.text }.orEmpty()
+                // The side chat's turn waits until released; the main turn waits on its own gate.
+                if (text.contains("side job")) { releaseB.await(); return Completion(say("side done"), "end_turn") }
+                if (text.contains("main job")) { releaseA.await(); return Completion(say("main done"), "end_turn") }
+                return Completion(say("ok"), "end_turn")
+            }
+        }
+        val rt = runtimeFor(p)
+        rt.send("main job please")
+        until { rt.statusFor("main").value.working }
+        val side = rt.newChat("Side")
+        rt.switchChat(side)
+        rt.send("side job please")
+        // Both chats show working at the same time: neither blocks the other.
+        until { rt.statusFor("main").value.working && rt.statusFor(side).value.working }
+        assertTrue(rt.statusFor("main").value.working)
+        assertTrue(rt.statusFor(side).value.working)
+        // Stopping the visible chat only stops its own work: main keeps going.
+        rt.stop(side)
+        until { !rt.statusFor(side).value.working }
+        assertFalse(rt.statusFor(side).value.working)
+        assertTrue(rt.statusFor("main").value.working)
+        releaseA.complete(Unit)
+        withTimeout(15_000) { rt.awaitIdle() }
+        assertEquals("main done", db.chat().all().first().last { it.chatId == "main" && it.kind == "agent" }.text)
+    }
     @Test fun freshChatGetsAnLlmTitleAfterFirstMessage() = runBlocking {
-        val p = TitledProvider("Flight options", say("On it, checking."))
+        val p = TitledProvider("Flight options", say("On it, checking."), say("extra reply"))
         val rt = runtime(p)
         val other = rt.newChat("New chat")
         rt.send("find me cheap flights to durban")
@@ -176,18 +211,19 @@ class MultiChatIndependenceTest {
         until { db.chat().all().first().any { it.kind == "question" } }
         val q = db.chat().all().first().first { it.kind == "question" }
         assertEquals("main", q.chatId)
-        // The main agent is one agent: Side's turn queues behind the open question, then runs in Side.
+        // Typing in another chat is its own message, not an answer to "main"'s card.
+        // Chats run in parallel: Side's turn starts right away while main stays parked on its question.
         val other = rt.newChat("Side")
         rt.send("hello over here")
         until { db.chat().all().first().any { it.chatId == other && it.kind == "user" } }
-        // The question is still open (nothing auto-answered it) and Side shows no work of its own yet.
+        // The question is still open (nothing auto-answered it) while Side works its own turn.
         assertTrue(JSONObject(db.chat().get(q.id)?.meta ?: "{}").optString("answer").isEmpty())
         assertTrue(rt.statusFor("main").value.label == "Waiting for you")
-        assertFalse(rt.statusFor(other).value.working)
+        until { db.chat().all().first().any { it.chatId == other && it.kind == "agent" } }
         rt.answer(q.id, "Red")
         withTimeout(15_000) { rt.awaitIdle() }
         assertEquals("Red", JSONObject(db.chat().get(q.id)?.meta ?: "{}").optString("answer"))
-        // Side's message ran as its own turn once the question cleared: reply in Side, no branch.
+        // Side's message ran as its own turn in Side: reply in Side, no branch.
         assertEquals(1, db.chat().all().first().filter { it.chatId == other && it.kind == "agent" }.size)
         assertTrue(db.chat().all().first().none { it.kind == "branch" })
     }
